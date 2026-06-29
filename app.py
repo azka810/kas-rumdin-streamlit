@@ -38,6 +38,22 @@ CATEGORIES = [
 METHODS = ["Kas", "Transfer", "QRIS", "Lainnya"]
 DEFAULT_FUNDS = ["Kas Rayhan", "Kas Azka"]
 
+CATEGORY_RULES = {
+    "Saldo Awal": ["saldo awal", "opening balance", "awal kas"],
+    "Inject Dana / Top Up": ["inject", "top up", "topup", "tambah dana", "tambahan dana", "isi kas", "isi saldo", "setor", "setoran"],
+    "Iuran Bulanan": ["iuran", "kas bulanan", "bulanan", "patungan kas"],
+    "Sewa": ["sewa", "kontrakan", "rent", "kos", "kost"],
+    "Internet": ["wifi", "wi-fi", "internet", "indihome", "biznet", "first media", "router", "modem"],
+    "Listrik": ["listrik", "pln", "token", "pulsa listrik", "kwh"],
+    "Air / PDAM": ["pdam", "air", "galon", "aqua", "le minerale", "isi ulang"],
+    "Laundry": ["laundry", "cuci", "setrika"],
+    "Perlengkapan Rumah": ["lampu", "sapu", "pel", "ember", "keset", "sabun", "tisu", "tisue", "detergen", "deterjen", "piring", "gelas", "sendok", "garpu", "wajan", "panci", "kabel", "terminal", "stop kontak", "sprei", "bantal", "guling", "hanger", "gantungan"],
+    "Pemeliharaan": ["service", "servis", "perbaikan", "benerin", "betulin", "maintenance", "tukang", "tambal", "ganti", "instalasi", "pasang"],
+    "Renovasi": ["renov", "renovasi", "cat", "semen", "paku", "bor", "triplek", "keramik"],
+    "Aset Rumah": ["kipas", "dispenser", "kompor", "kasur", "lemari", "rak", "meja", "kursi", "magic com", "rice cooker", "ac", "kulkas"],
+    "Kebersihan": ["kebersihan", "sampah", "cleaning", "karbol", "wipol", "sikat", "lap", "kanebo", "baygon", "obat nyamuk"],
+}
+
 st.set_page_config(
     page_title=APP_TITLE,
     page_icon="🏠",
@@ -122,6 +138,70 @@ def clean_amount(value: Any) -> int:
         return max(0, int(digits or 0))
     except Exception:
         return 0
+
+
+
+def normalize_text(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).lower().strip()
+
+
+def infer_category(description: Any, note: Any = "", tx_type: str = "Keluar") -> str:
+    """Infer a transaction category from description/note keywords."""
+    combined = f"{normalize_text(description)} {normalize_text(note)}"
+    if tx_type == "Masuk":
+        for category in ["Saldo Awal", "Inject Dana / Top Up", "Iuran Bulanan"]:
+            if any(keyword in combined for keyword in CATEGORY_RULES.get(category, [])):
+                return category
+        return "Iuran Bulanan"
+    for category, keywords in CATEGORY_RULES.items():
+        if category in {"Saldo Awal", "Inject Dana / Top Up", "Iuran Bulanan"}:
+            continue
+        if any(keyword in combined for keyword in keywords):
+            return category
+    return "Lainnya"
+
+
+def recategorize_by_rules(only_lainnya: bool = True) -> int:
+    df = fetch_transactions()
+    if df.empty:
+        return 0
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    conn = get_conn()
+    changed = 0
+    for _, row in df.iterrows():
+        current = str(row.get("category") or "Lainnya")
+        if only_lainnya and current != "Lainnya":
+            continue
+        new_category = infer_category(row.get("description", ""), row.get("note", ""), str(row.get("type", "Keluar")))
+        if new_category and new_category != current:
+            conn.execute("UPDATE transactions SET category=?, updated_at=? WHERE id=?", (new_category, now, int(row["id"])))
+            changed += 1
+    conn.commit()
+    return changed
+
+
+def recategorize_by_keyword(keywords: List[str], new_category: str, only_lainnya: bool = True) -> int:
+    cleaned = [k.strip().lower() for k in keywords if k.strip()]
+    if not cleaned:
+        return 0
+    df = fetch_transactions()
+    if df.empty:
+        return 0
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    conn = get_conn()
+    changed = 0
+    for _, row in df.iterrows():
+        current = str(row.get("category") or "Lainnya")
+        if only_lainnya and current != "Lainnya":
+            continue
+        haystack = f"{normalize_text(row.get('description', ''))} {normalize_text(row.get('note', ''))}"
+        if any(keyword in haystack for keyword in cleaned):
+            conn.execute("UPDATE transactions SET category=?, updated_at=? WHERE id=?", (new_category, now, int(row["id"])))
+            changed += 1
+    conn.commit()
+    return changed
 
 
 def parse_date(value: Any) -> str:
@@ -875,6 +955,71 @@ def page_import_export(df: pd.DataFrame, budgets: pd.DataFrame) -> None:
             st.error("Konfirmasi belum sesuai.")
 
 
+
+def page_bulk_category(df: pd.DataFrame) -> None:
+    st.title("🧠 Kategorisasi Massal")
+    st.caption("Pakai menu ini kalau banyak transaksi masih kebaca sebagai Lainnya. Sistem akan membaca kata kunci dari keterangan/catatan transaksi.")
+    if df.empty:
+        st.info("Belum ada transaksi.")
+        return
+
+    total_lainnya = int((df["category"] == "Lainnya").sum()) if "category" in df.columns else 0
+    total_rows = len(df)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Transaksi", f"{total_rows}")
+    c2.metric("Masih Lainnya", f"{total_lainnya}")
+    c3.metric("Proporsi Lainnya", f"{(total_lainnya / total_rows * 100):.1f}%" if total_rows else "0%")
+
+    st.subheader("1) Auto-kategorisasi dari keyword")
+    only_lainnya_auto = st.toggle("Hanya ubah transaksi yang kategorinya masih Lainnya", value=True, key="auto_only_lainnya")
+    preview = df.copy()
+    if only_lainnya_auto:
+        preview = preview[preview["category"] == "Lainnya"]
+    preview["Kategori Usulan"] = preview.apply(lambda r: infer_category(r.get("description", ""), r.get("note", ""), str(r.get("type", "Keluar"))), axis=1)
+    preview = preview[preview["Kategori Usulan"] != preview["category"]]
+
+    st.write(f"Transaksi yang akan berubah kalau tombol diterapkan: **{len(preview)}**")
+    if not preview.empty:
+        show = preview.copy().head(50)
+        show["Tanggal"] = pd.to_datetime(show["date"], errors="coerce").dt.strftime("%d/%m/%Y")
+        show["Nominal"] = show["amount"].apply(compact_rp)
+        display_df(show[["id", "Tanggal", "fund", "type", "Nominal", "category", "Kategori Usulan", "description"]].rename(columns={"fund": "Sumber Dana", "type": "Jenis", "category": "Kategori Lama", "description": "Keterangan"}))
+    else:
+        st.info("Belum ada transaksi yang cocok dengan keyword default.")
+
+    if st.button("Terapkan Auto-kategorisasi", type="primary"):
+        changed = recategorize_by_rules(only_lainnya=only_lainnya_auto)
+        st.success(f"Berhasil mengubah {changed} transaksi.")
+        st.rerun()
+
+    st.divider()
+    st.subheader("2) Ubah massal berdasarkan kata kunci sendiri")
+    st.caption("Contoh: isi keyword `wifi, internet, indihome`, pilih kategori Internet, lalu terapkan.")
+    with st.form("manual_keyword_category"):
+        c1, c2 = st.columns([2, 1])
+        keywords_text = c1.text_input("Keyword keterangan/catatan", placeholder="wifi, internet, laundry, galon")
+        new_category = c2.selectbox("Ubah jadi kategori", CATEGORIES, index=CATEGORIES.index("Lainnya"))
+        only_lainnya_manual = st.checkbox("Hanya ubah yang masih Lainnya", value=True)
+        submitted = st.form_submit_button("Terapkan Keyword Ini", type="primary")
+    if submitted:
+        keywords = [x.strip() for x in keywords_text.split(",") if x.strip()]
+        if not keywords:
+            st.error("Isi minimal satu keyword.")
+        elif new_category == "Lainnya":
+            st.error("Pilih kategori selain Lainnya supaya ada perubahan.")
+        else:
+            changed = recategorize_by_keyword(keywords, new_category, only_lainnya=only_lainnya_manual)
+            st.success(f"Berhasil mengubah {changed} transaksi menjadi {new_category}.")
+            st.rerun()
+
+    st.divider()
+    st.subheader("Daftar keyword default")
+    rules_rows = []
+    for category, keywords in CATEGORY_RULES.items():
+        rules_rows.append({"Kategori": category, "Keyword": ", ".join(keywords)})
+    display_df(pd.DataFrame(rules_rows))
+
+
 def page_settings(df: pd.DataFrame) -> None:
     st.title("⚙️ Pengaturan & Info Deploy")
     st.write("Lokasi database aktif:")
@@ -904,7 +1049,7 @@ def main() -> None:
     st.sidebar.title("🏠 Kas Rumdin")
     page = st.sidebar.radio(
         "Menu",
-        ["Dashboard", "Input Transaksi", "Buku Besar", "Budget Bulanan", "Import / Export", "Pengaturan"],
+        ["Dashboard", "Input Transaksi", "Buku Besar", "Kategorisasi Massal", "Budget Bulanan", "Import / Export", "Pengaturan"],
     )
     st.sidebar.divider()
     st.sidebar.caption("Default password: rumdin123")
@@ -918,6 +1063,8 @@ def main() -> None:
         page_input(df)
     elif page == "Buku Besar":
         page_ledger(df)
+    elif page == "Kategorisasi Massal":
+        page_bulk_category(df)
     elif page == "Budget Bulanan":
         page_budget(df, budgets)
     elif page == "Import / Export":
