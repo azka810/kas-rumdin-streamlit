@@ -1,8 +1,10 @@
+
 from __future__ import annotations
 
 import io
 import json
 import os
+import re
 import sqlite3
 from datetime import date, datetime
 from pathlib import Path
@@ -11,7 +13,8 @@ from typing import Any, Dict, Iterable, List, Tuple
 import pandas as pd
 import streamlit as st
 
-APP_TITLE = "Kas Rumah Dinas"
+APP_TITLE = "V.4 Padebuolo Next"
+APP_VERSION = "v4.9 PASTI BARU - DD/MM/YYYY + Pergerakan Belanja + Sinkron Tanggal"
 DEFAULT_PASSWORD = "rumdin123"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -37,6 +40,150 @@ CATEGORIES = [
 ]
 METHODS = ["Kas", "Transfer", "QRIS", "Lainnya"]
 DEFAULT_FUNDS = ["Kas Rayhan", "Kas Azka"]
+
+ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+DMY_SLASH_RE = re.compile(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$")
+MONTH_NAMES_ID = {
+    1: "Januari",
+    2: "Februari",
+    3: "Maret",
+    4: "April",
+    5: "Mei",
+    6: "Juni",
+    7: "Juli",
+    8: "Agustus",
+    9: "September",
+    10: "Oktober",
+    11: "November",
+    12: "Desember",
+}
+MONTH_NAMES_ID_LOOKUP = {name.lower(): num for num, name in MONTH_NAMES_ID.items()}
+MONTH_NAMES_ID_LOOKUP.update({
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "mei": 5,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "agu": 8,
+    "ags": 8,
+    "aug": 8,
+    "sep": 9,
+    "okt": 10,
+    "oct": 10,
+    "nov": 11,
+    "des": 12,
+    "dec": 12,
+})
+
+
+def parse_any_date(value: Any) -> pd.Timestamp:
+    """Parse dates consistently using Indonesian/DD-MM-YYYY assumptions.
+
+    Database dates are stored as ISO YYYY-MM-DD for sorting. User-facing dates may
+    come from Excel/CSV as DD/MM/YYYY, DD-MM-YYYY, Excel serial numbers, or
+    Indonesian month names such as "10 April 2026". This function keeps those
+    cases from being flipped into US month/day order.
+    """
+    if value is None:
+        return pd.NaT
+    if isinstance(value, pd.Timestamp):
+        return pd.Timestamp(value.date()) if not pd.isna(value) else pd.NaT
+    if isinstance(value, datetime):
+        return pd.Timestamp(value.date())
+    if isinstance(value, date):
+        return pd.Timestamp(value)
+    try:
+        if pd.isna(value):
+            return pd.NaT
+    except Exception:
+        pass
+
+    # Excel often stores dates as serial numbers. Keep this before string parsing.
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            num = float(value)
+            if 20_000 <= num <= 80_000:
+                return pd.to_datetime(num, unit="D", origin="1899-12-30", errors="coerce")
+        except Exception:
+            pass
+
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "nat", "-"}:
+        return pd.NaT
+
+    # Drop time suffix if the value is like "2026-04-10 00:00:00".
+    text_date_only = text.split()[0] if ISO_DATE_RE.match(text) else text
+
+    # Internal DB / ISO format: YYYY-MM-DD must never be parsed day-first.
+    if ISO_DATE_RE.match(text_date_only):
+        return pd.to_datetime(text_date_only[:10], format="%Y-%m-%d", errors="coerce")
+
+    # Indonesian numeric format: DD/MM/YYYY or DD-MM-YYYY.
+    m = DMY_SLASH_RE.match(text_date_only)
+    if m:
+        d, mth, y = map(int, m.groups())
+        try:
+            return pd.Timestamp(year=y, month=mth, day=d)
+        except Exception:
+            return pd.NaT
+
+    # Indonesian month-name format: 10 April 2026 / 10 Apr 2026.
+    m = re.match(r"^(\d{1,2})\s+([A-Za-zÀ-ÿ]+)\s+(\d{4})$", text, flags=re.IGNORECASE)
+    if m:
+        d = int(m.group(1))
+        month_text = m.group(2).lower()
+        y = int(m.group(3))
+        month_num = MONTH_NAMES_ID_LOOKUP.get(month_text)
+        if month_num:
+            try:
+                return pd.Timestamp(year=y, month=month_num, day=d)
+            except Exception:
+                return pd.NaT
+
+    # Last fallback still assumes Indonesian/DD-first order.
+    return pd.to_datetime(text, dayfirst=True, errors="coerce")
+
+
+def format_date_short_id(value: Any) -> str:
+    parsed = parse_any_date(value)
+    if pd.isna(parsed):
+        return ""
+    return parsed.strftime("%d/%m/%Y")
+
+
+def format_date_id(value: Any) -> str:
+    """Display date in DD/MM/YYYY format, e.g. 10/04/2026."""
+    parsed = parse_any_date(value)
+    if pd.isna(parsed):
+        return ""
+    return parsed.strftime("%d/%m/%Y")
+
+
+def month_key_from_date(value: Any) -> str:
+    parsed = parse_any_date(value)
+    if pd.isna(parsed):
+        return ""
+    return parsed.strftime("%Y-%m")
+
+
+def format_month_key_id(month_key: Any) -> str:
+    text = str(month_key).strip()
+    parsed = pd.to_datetime(f"{text}-01", format="%Y-%m-%d", errors="coerce")
+    if pd.isna(parsed):
+        return text
+    return f"{MONTH_NAMES_ID[int(parsed.month)]} {int(parsed.year)}"
+
+
+def date_input_id(container: Any, label: str, value: date, **kwargs: Any) -> date:
+    """Streamlit date input with Indonesian numeric display when supported."""
+    label = f"{label} (DD/MM/YYYY)"
+    try:
+        return container.date_input(label, value=value, format="DD/MM/YYYY", **kwargs)
+    except TypeError:
+        return container.date_input(label, value=value, **kwargs)
 
 CATEGORY_RULES = {
     "Saldo Awal": ["saldo awal", "opening balance", "awal kas"],
@@ -205,16 +352,228 @@ def recategorize_by_keyword(keywords: List[str], new_category: str, only_lainnya
 
 
 def parse_date(value: Any) -> str:
-    if isinstance(value, datetime):
-        return value.date().isoformat()
-    if isinstance(value, date):
-        return value.isoformat()
-    if value is None or str(value).strip() == "":
-        return date.today().isoformat()
-    parsed = pd.to_datetime(value, dayfirst=True, errors="coerce")
+    parsed = parse_any_date(value)
     if pd.isna(parsed):
         return date.today().isoformat()
     return parsed.date().isoformat()
+
+
+def infer_swapped_source_month(df: pd.DataFrame) -> int:
+    """Infer the original month when old imports were parsed as MM/DD/YYYY.
+
+    Example wrong stored value: 2026-11-04. The day value (4) is likely the
+    original month, so the repaired value should be 2026-04-11.
+    """
+    if df.empty or "date" not in df.columns:
+        return int(date.today().month)
+    counts: Dict[int, int] = {}
+    for raw in df["date"].dropna().astype(str).tolist():
+        text = raw.strip()
+        if not ISO_DATE_RE.match(text):
+            continue
+        ts = pd.to_datetime(text[:10], format="%Y-%m-%d", errors="coerce")
+        if pd.isna(ts):
+            continue
+        # Only ambiguous dates can be flipped by an old month-first parser.
+        if 1 <= int(ts.day) <= 12 and 1 <= int(ts.month) <= 12 and int(ts.day) != int(ts.month):
+            counts[int(ts.day)] = counts.get(int(ts.day), 0) + 1
+    if counts:
+        return max(counts.items(), key=lambda item: item[1])[0]
+    return int(date.today().month)
+
+
+def swapped_date_candidates(df: pd.DataFrame, correct_month: int) -> pd.DataFrame:
+    """Return rows that look like old MM/DD parsing and can be safely previewed.
+
+    If correct_month is 4, a stored ISO date like 2026-11-04 is proposed as
+    2026-04-11. Correct dates like 2026-04-11 are not touched because the day is
+    11, not the selected correct month 4.
+    """
+    rows: List[Dict[str, Any]] = []
+    if df.empty or "date" not in df.columns:
+        return pd.DataFrame(rows)
+
+    for _, row in df.iterrows():
+        old_text = str(row.get("date") or "").strip()
+        if not ISO_DATE_RE.match(old_text):
+            continue
+        old_ts = pd.to_datetime(old_text[:10], format="%Y-%m-%d", errors="coerce")
+        if pd.isna(old_ts):
+            continue
+        old_day = int(old_ts.day)
+        old_month = int(old_ts.month)
+        if old_day != int(correct_month):
+            continue
+        if old_month == int(correct_month):
+            continue
+        if not (1 <= old_month <= 12):
+            continue
+        try:
+            new_ts = pd.Timestamp(year=int(old_ts.year), month=int(correct_month), day=old_month)
+        except Exception:
+            continue
+        rows.append(
+            {
+                "id": int(row.get("id")),
+                "Tanggal Lama": old_ts.strftime("%d/%m/%Y"),
+                "Tanggal Baru": new_ts.strftime("%d/%m/%Y"),
+                "date_lama_iso": old_ts.strftime("%Y-%m-%d"),
+                "date_baru_iso": new_ts.strftime("%Y-%m-%d"),
+                "Sumber Dana": row.get("fund", ""),
+                "Jenis": row.get("type", ""),
+                "Kategori": row.get("category", ""),
+                "Keterangan": row.get("description", ""),
+                "Nominal": int(row.get("amount") or 0),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def apply_swapped_date_fix(candidates: pd.DataFrame) -> int:
+    if candidates.empty:
+        return 0
+    conn = get_conn()
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    changed = 0
+    for _, row in candidates.iterrows():
+        conn.execute(
+            "UPDATE transactions SET date=?, updated_at=? WHERE id=?",
+            (str(row["date_baru_iso"]), now, int(row["id"])),
+        )
+        changed += 1
+    conn.commit()
+    return changed
+
+
+def _key_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def _tx_signature(row: Dict[str, Any]) -> Tuple[str, str, int, str]:
+    return (
+        _key_text(row.get("fund", "")),
+        _key_text(row.get("type", "")),
+        int(clean_amount(row.get("amount", 0))),
+        _key_text(row.get("description", "")),
+    )
+
+
+def _add_occurrence_keys(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str, int, str, int], Dict[str, Any]]:
+    counters: Dict[Tuple[str, str, int, str], int] = {}
+    keyed: Dict[Tuple[str, str, int, str, int], Dict[str, Any]] = {}
+    for row in rows:
+        sig = _tx_signature(row)
+        counters[sig] = counters.get(sig, 0) + 1
+        keyed[sig + (counters[sig],)] = row
+    return keyed
+
+
+def load_seed_transactions_for_date_repair() -> pd.DataFrame:
+    """Load the clean starting transactions used as the source of truth for dates.
+
+    This fixes the real issue where older app versions already saved 11/04/2026
+    as 2026-11-04 in SQLite. Merely changing display format cannot repair that.
+    The seed file is treated as the source of truth and dates are parsed as DD/MM/YYYY
+    or Excel serials.
+    """
+    tx_path = DATA_DIR / "seed_transactions.csv"
+    xlsx_path = DATA_DIR / "Rekap Kas Rumdin.xlsx"
+    try:
+        if tx_path.exists():
+            raw = pd.read_csv(tx_path)
+            rows = normalize_transactions_from_df(raw)
+            return pd.DataFrame(rows)
+        if xlsx_path.exists():
+            xl = pd.ExcelFile(xlsx_path)
+            sheet_name = "Master Kas" if "Master Kas" in xl.sheet_names else xl.sheet_names[0]
+            rows = normalize_transactions_from_df(pd.read_excel(xl, sheet_name=sheet_name))
+            return pd.DataFrame(rows)
+    except Exception:
+        return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def seed_date_repair_candidates(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    seed_df = load_seed_transactions_for_date_repair()
+    if seed_df.empty:
+        return pd.DataFrame()
+
+    seed_rows = seed_df.to_dict("records")
+    current_rows = df.to_dict("records")
+    seed_keyed = _add_occurrence_keys(seed_rows)
+    current_keyed = _add_occurrence_keys(current_rows)
+
+    rows: List[Dict[str, Any]] = []
+    for key, cur in current_keyed.items():
+        seed = seed_keyed.get(key)
+        if seed is None:
+            continue
+        cur_iso = parse_date(cur.get("date"))
+        seed_iso = parse_date(seed.get("date"))
+        if cur_iso == seed_iso:
+            continue
+        rows.append(
+            {
+                "id": int(cur.get("id")),
+                "Tanggal Lama": format_date_id(cur_iso),
+                "Tanggal Seharusnya": format_date_id(seed_iso),
+                "date_lama_iso": cur_iso,
+                "date_baru_iso": seed_iso,
+                "Sumber Dana": cur.get("fund", ""),
+                "Jenis": cur.get("type", ""),
+                "Kategori": cur.get("category", ""),
+                "Keterangan": cur.get("description", ""),
+                "Nominal": int(clean_amount(cur.get("amount", 0))),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def apply_seed_date_repair(candidates: pd.DataFrame) -> int:
+    if candidates.empty:
+        return 0
+    conn = get_conn()
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    changed = 0
+    for _, row in candidates.iterrows():
+        conn.execute(
+            "UPDATE transactions SET date=?, updated_at=? WHERE id=?",
+            (str(row["date_baru_iso"]), now, int(row["id"])),
+        )
+        changed += 1
+    conn.execute(
+        "INSERT OR REPLACE INTO app_meta(key, value) VALUES('date_seed_repair_v48_applied_at', ?)",
+        (now,),
+    )
+    conn.commit()
+    return changed
+
+
+def auto_repair_dates_from_seed_once() -> None:
+    """Auto-fix old wrongly parsed seed dates once, without touching new custom rows."""
+    try:
+        conn = get_conn()
+        already = conn.execute(
+            "SELECT value FROM app_meta WHERE key='date_seed_repair_v48_applied_at'"
+        ).fetchone()
+        if already:
+            return
+        df = pd.DataFrame(run_query("SELECT * FROM transactions ORDER BY date ASC, id ASC"))
+        candidates = seed_date_repair_candidates(df)
+        if not candidates.empty:
+            apply_seed_date_repair(candidates)
+        else:
+            now = datetime.utcnow().isoformat(timespec="seconds")
+            conn.execute(
+                "INSERT OR REPLACE INTO app_meta(key, value) VALUES('date_seed_repair_v48_applied_at', ?)",
+                (now,),
+            )
+            conn.commit()
+    except Exception:
+        # Do not block app startup just because repair preview failed.
+        pass
 
 
 @st.cache_resource(show_spinner=False)
@@ -266,6 +625,7 @@ def init_db() -> None:
     )
     conn.commit()
     seed_if_empty()
+    auto_repair_dates_from_seed_once()
 
 
 def seed_if_empty() -> None:
@@ -414,7 +774,7 @@ def summarize(df: pd.DataFrame) -> Dict[str, Any]:
     total_out = int(df.loc[df["type"] == "Keluar", "amount"].sum())
     fund_balance = df.groupby("fund", as_index=False)["netto"].sum().rename(columns={"netto": "saldo"}).sort_values("saldo", ascending=False)
     tmp = df.copy()
-    tmp["month"] = pd.to_datetime(tmp["date"], errors="coerce").dt.to_period("M").astype(str)
+    tmp["month"] = tmp["date"].apply(month_key_from_date)
     monthly_out = tmp[tmp["type"] == "Keluar"].groupby("month", as_index=False)["amount"].sum().rename(columns={"amount": "keluar"})
     category_out = tmp[tmp["type"] == "Keluar"].groupby("category", as_index=False)["amount"].sum().rename(columns={"amount": "keluar"}).sort_values("keluar", ascending=False)
     return {
@@ -428,39 +788,106 @@ def summarize(df: pd.DataFrame) -> Dict[str, Any]:
 
 
 def display_df(df: pd.DataFrame, use_container_width: bool = True) -> None:
-    st.dataframe(df, use_container_width=use_container_width, hide_index=True)
+    view = df.copy()
+    rename_map = {}
+    for col in list(view.columns):
+        if str(col).lower() == "date":
+            view[col] = view[col].apply(format_date_id)
+            rename_map[col] = "Tanggal"
+        elif str(col).lower() == "tanggal":
+            view[col] = view[col].apply(format_date_id)
+    if rename_map:
+        view = view.rename(columns=rename_map)
+    st.dataframe(view, use_container_width=use_container_width, hide_index=True)
+
+
+def get_balance_by_fund_label(df: pd.DataFrame, label: str) -> int:
+    """Return current balance for a fund label using exact or loose matching."""
+    if df.empty:
+        return 0
+    fund_balance = summarize(df)["fund_balance"]
+    if fund_balance.empty:
+        return 0
+
+    target = label.strip().lower()
+    fb = fund_balance.copy()
+    fb["fund_norm"] = fb["fund"].astype(str).str.strip().str.lower()
+
+    exact = fb[fb["fund_norm"] == target]
+    if not exact.empty:
+        return int(exact["saldo"].sum())
+
+    loose = fb[fb["fund_norm"].str.contains(target, na=False)]
+    if not loose.empty:
+        return int(loose["saldo"].sum())
+    return 0
 
 
 def ledger_view(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
     out = df.copy().sort_values(["date", "id"]).copy()
-    out["Tanggal"] = pd.to_datetime(out["date"], errors="coerce").dt.strftime("%d/%m/%Y")
+    out["Tanggal"] = out["date"].apply(format_date_id)
     out["Sumber Dana"] = out["fund"]
     out["Kategori"] = out["category"]
     out["Keterangan"] = out["description"]
     out["Masuk"] = out.apply(lambda r: compact_rp(r["amount"]) if r["type"] == "Masuk" else "-", axis=1)
     out["Keluar"] = out.apply(lambda r: compact_rp(r["amount"]) if r["type"] == "Keluar" else "-", axis=1)
     out["Netto"] = out["netto"].apply(compact_rp)
-    out["Sisa Kas"] = out["running_balance"].apply(compact_rp)
     out["Metode"] = out["method"].fillna("Kas")
     out["Catatan"] = out["note"].fillna("")
-    return out[["id", "Tanggal", "Sumber Dana", "Kategori", "Keterangan", "Masuk", "Keluar", "Netto", "Sisa Kas", "Metode", "Catatan"]]
+    return out[["id", "Tanggal", "Sumber Dana", "Kategori", "Keterangan", "Masuk", "Keluar", "Netto", "Metode", "Catatan"]]
 
 
 def detail_ledger_view(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
     out = df.copy().sort_values(["date", "id"]).copy()
-    out["Tanggal"] = pd.to_datetime(out["date"], errors="coerce").dt.strftime("%d/%m/%Y")
+    out["Tanggal"] = out["date"].apply(format_date_id)
     out["Masuk Detail"] = out.apply(lambda r: full_rp(r["amount"]) if r["type"] == "Masuk" else "-", axis=1)
     out["Keluar Detail"] = out.apply(lambda r: full_rp(r["amount"]) if r["type"] == "Keluar" else "-", axis=1)
     out["Netto Detail"] = out["netto"].apply(full_rp)
-    out["Sisa Kas Detail"] = out["running_balance"].apply(full_rp)
-    return out[["id", "Tanggal", "fund", "category", "description", "Masuk Detail", "Keluar Detail", "Netto Detail", "Sisa Kas Detail", "method", "note"]].rename(
+    return out[["id", "Tanggal", "fund", "category", "description", "Masuk Detail", "Keluar Detail", "Netto Detail", "method", "note"]].rename(
         columns={"fund": "Sumber Dana", "category": "Kategori", "description": "Keterangan", "method": "Metode", "note": "Catatan"}
     )
 
+
+
+def monthly_category_summary(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Return monthly spending by category in long and pivot format."""
+    if df.empty:
+        empty_long = pd.DataFrame(columns=["Bulan", "Kategori", "Nominal"])
+        empty_pivot = pd.DataFrame()
+        return empty_long, empty_pivot
+
+    out = df[df["type"] == "Keluar"].copy()
+    if out.empty:
+        empty_long = pd.DataFrame(columns=["Bulan", "Kategori", "Nominal"])
+        empty_pivot = pd.DataFrame()
+        return empty_long, empty_pivot
+
+    out["tanggal_dt"] = out["date"].apply(parse_any_date)
+    out = out.dropna(subset=["tanggal_dt"])
+    if out.empty:
+        empty_long = pd.DataFrame(columns=["Bulan", "Kategori", "Nominal"])
+        empty_pivot = pd.DataFrame()
+        return empty_long, empty_pivot
+
+    out["BulanKey"] = out["tanggal_dt"].dt.to_period("M").astype(str)
+    out["Bulan"] = out["BulanKey"].apply(format_month_key_id)
+    out["Kategori"] = out["category"].fillna("Lainnya").astype(str)
+    grouped = (
+        out.groupby(["BulanKey", "Bulan", "Kategori"], as_index=False)["amount"]
+        .sum()
+        .rename(columns={"amount": "Nominal"})
+        .sort_values(["BulanKey", "Kategori"])
+    )
+    pivot_key = grouped.pivot_table(index="BulanKey", columns="Kategori", values="Nominal", aggfunc="sum", fill_value=0).sort_index()
+    pivot = pivot_key.copy()
+    pivot.index = [format_month_key_id(idx) for idx in pivot.index]
+    pivot.index.name = "Bulan"
+    pivot = pivot.astype(int)
+    return grouped[["Bulan", "Kategori", "Nominal"]], pivot
 
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
@@ -490,7 +917,16 @@ def export_excel_bytes() -> bytes:
             fb["saldo_detail"] = fb["saldo"].apply(full_rp)
             fb.to_excel(writer, sheet_name="Saldo Kas", index=False)
         budgets.to_excel(writer, sheet_name="Budget Bulanan", index=False)
-        raw = tx.drop(columns=["netto", "running_balance"], errors="ignore")
+        monthly_long, monthly_pivot = monthly_category_summary(tx)
+        if not monthly_long.empty:
+            monthly_long_export = monthly_long.copy()
+            monthly_long_export["Nominal Detail"] = monthly_long_export["Nominal"].apply(full_rp)
+            monthly_long_export.to_excel(writer, sheet_name="Belanja Bulanan", index=False)
+            monthly_pivot.to_excel(writer, sheet_name="Pivot Belanja Bulanan")
+        raw = tx.drop(columns=["netto", "running_balance"], errors="ignore").copy()
+        if "date" in raw.columns:
+            raw.insert(1, "Tanggal", raw["date"].apply(format_date_id))
+            raw.insert(2, "Tanggal Singkat", raw["date"].apply(format_date_short_id))
         raw.to_excel(writer, sheet_name="Raw Transactions", index=False)
     return buffer.getvalue()
 
@@ -621,7 +1057,7 @@ def render_login() -> bool:
         return True
     if st.session_state.get("authenticated"):
         return True
-    st.title("🏠 Kas Rumah Dinas")
+    st.title("🏠 V.4 Padebuolo Next")
     st.caption("Masuk dulu pak. Default password: rumdin123, bisa diganti di secrets/env APP_PASSWORD.")
     with st.form("login_form"):
         user_input = st.text_input("Password", type="password")
@@ -636,7 +1072,7 @@ def render_login() -> bool:
 
 
 def page_dashboard(df: pd.DataFrame, budgets: pd.DataFrame) -> None:
-    st.title("🏠 Dashboard Kas Rumah Dinas")
+    st.title("🏠 Dashboard V.4 Padebuolo Next")
     st.markdown("<div class='small-note'>Angka utama ditampilkan ringkas. Arahkan/keterangan help pada kartu atau buka detail angka untuk nominal penuh.</div>", unsafe_allow_html=True)
 
     s = summarize(df)
@@ -696,7 +1132,7 @@ def page_input(df: pd.DataFrame) -> None:
     st.subheader("Mode Cepat")
     c1, c2, c3 = st.columns(3)
     quick_mode = c1.selectbox("Jenis input cepat", ["Inject Dana / Top Up", "Pengeluaran Split", "Transaksi Biasa"])
-    tx_date = c2.date_input("Tanggal", value=date.today())
+    tx_date = date_input_id(c2, "Tanggal", value=date.today())
     method = c3.selectbox("Metode", METHODS, index=0)
 
     if quick_mode == "Inject Dana / Top Up":
@@ -767,6 +1203,16 @@ def page_ledger(df: pd.DataFrame) -> None:
         st.info("Belum ada transaksi.")
         return
 
+    st.subheader("Rekap Sisa Kas")
+    azka_balance = get_balance_by_fund_label(df, "Azka")
+    rayhan_balance = get_balance_by_fund_label(df, "Rayhan")
+    total_balance = summarize(df)["saldo"]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Sisa Kas Azka", compact_rp(azka_balance), help=full_rp(azka_balance))
+    c2.metric("Sisa Kas Rayhan", compact_rp(rayhan_balance), help=full_rp(rayhan_balance))
+    c3.metric("Total Sisa Kas", compact_rp(total_balance), help=full_rp(total_balance))
+    st.caption("Rekap sisa kas dihitung dari seluruh transaksi masuk dikurangi keluar per sumber dana. Tabel buku besar di bawah hanya menampilkan transaksi, bukan saldo berjalan per baris.")
+
     filters = st.container(border=True)
     with filters:
         c1, c2, c3, c4 = st.columns([1, 1, 1, 1.4])
@@ -787,7 +1233,7 @@ def page_ledger(df: pd.DataFrame) -> None:
         kw = keyword.strip().lower()
         fdf = fdf[fdf["description"].str.lower().str.contains(kw, na=False) | fdf["note"].fillna("").str.lower().str.contains(kw, na=False)]
 
-    st.caption("Kolom Sisa Kas = saldo berjalan per sumber dana setelah transaksi tersebut.")
+    st.caption("Buku besar transaksi: Masuk, Keluar, dan Netto. Sisa kas ditaruh sebagai rekap di atas supaya tidak membingungkan per baris.")
     display_df(ledger_view(fdf))
 
     with st.expander("Lihat nominal penuh"):
@@ -803,7 +1249,7 @@ def page_ledger(df: pd.DataFrame) -> None:
     row = df[df["id"] == selected_id].iloc[0].to_dict()
     with st.form("edit_tx_form"):
         c1, c2, c3 = st.columns(3)
-        tx_date = c1.date_input("Tanggal", value=pd.to_datetime(row["date"]).date(), key="edit_date")
+        tx_date = date_input_id(c1, "Tanggal", value=parse_any_date(row["date"]).date(), key="edit_date")
         fund = c2.text_input("Sumber dana", value=str(row["fund"]))
         tx_type = c3.selectbox("Jenis", ["Masuk", "Keluar"], index=0 if row["type"] == "Masuk" else 1)
         c4, c5, c6 = st.columns([1, 1, 2])
@@ -840,6 +1286,122 @@ def page_ledger(df: pd.DataFrame) -> None:
         st.warning("Transaksi dihapus.")
         st.rerun()
 
+
+
+def page_monthly_category(df: pd.DataFrame) -> None:
+    st.title("📊 Pergerakan Belanja Bulanan per Kategori")
+    st.caption("Menu ini khusus membaca transaksi jenis Keluar, lalu mengelompokkan pengeluaran per bulan dan kategori belanja.")
+
+    if df.empty:
+        st.info("Belum ada transaksi.")
+        return
+
+    out = df[df["type"] == "Keluar"].copy()
+    if out.empty:
+        st.info("Belum ada transaksi pengeluaran.")
+        return
+
+    out["tanggal_dt"] = out["date"].apply(parse_any_date)
+    out = out.dropna(subset=["tanggal_dt"])
+    if out.empty:
+        st.warning("Tanggal transaksi belum bisa dibaca. Cek format tanggal di data transaksi.")
+        return
+
+    out["BulanKey"] = out["tanggal_dt"].dt.to_period("M").astype(str)
+    available_months = sorted(out["BulanKey"].dropna().astype(str).unique().tolist())
+    available_categories = sorted(out["category"].fillna("Lainnya").astype(str).unique().tolist())
+
+    with st.container(border=True):
+        c1, c2, c3, c4 = st.columns([1, 1, 1.3, 1])
+        start_month = c1.selectbox("Dari bulan", available_months, index=0, format_func=format_month_key_id)
+        end_month = c2.selectbox("Sampai bulan", available_months, index=len(available_months) - 1, format_func=format_month_key_id)
+        selected_categories = c3.multiselect("Kategori", available_categories, default=available_categories)
+        selected_fund = c4.selectbox("Sumber dana", ["Semua"] + get_fund_list(df), index=0)
+
+    if start_month > end_month:
+        st.error("Bulan awal tidak boleh lebih besar dari bulan akhir.")
+        return
+
+    fdf = out[(out["BulanKey"] >= start_month) & (out["BulanKey"] <= end_month)].copy()
+    if selected_fund != "Semua":
+        fdf = fdf[fdf["fund"] == selected_fund]
+    if selected_categories:
+        fdf = fdf[fdf["category"].isin(selected_categories)]
+    else:
+        st.warning("Pilih minimal satu kategori.")
+        return
+
+    if fdf.empty:
+        st.info("Tidak ada pengeluaran sesuai filter.")
+        return
+
+    grouped, pivot = monthly_category_summary(fdf)
+    total_spending = int(fdf["amount"].sum())
+    monthly_total = pivot.sum(axis=1).sort_values(ascending=False) if not pivot.empty else pd.Series(dtype="int64")
+    category_total = pivot.sum(axis=0).sort_values(ascending=False) if not pivot.empty else pd.Series(dtype="int64")
+
+    biggest_month = monthly_total.index[0] if not monthly_total.empty else "-"
+    biggest_month_value = int(monthly_total.iloc[0]) if not monthly_total.empty else 0
+    biggest_category = category_total.index[0] if not category_total.empty else "-"
+    biggest_category_value = int(category_total.iloc[0]) if not category_total.empty else 0
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Belanja", compact_rp(total_spending), help=full_rp(total_spending))
+    c2.metric("Bulan Belanja Tertinggi", biggest_month, help=full_rp(biggest_month_value))
+    c3.metric("Kategori Terbesar", biggest_category, help=full_rp(biggest_category_value))
+
+    st.divider()
+    st.subheader("Grafik Pergerakan Bulanan")
+    chart_type = st.radio("Jenis grafik", ["Line chart", "Bar chart"], horizontal=True)
+    if chart_type == "Line chart":
+        st.line_chart(pivot)
+    else:
+        st.bar_chart(pivot)
+
+    st.subheader("Tabel Belanja Bulanan per Kategori")
+    table = pivot.copy()
+    table["Total"] = table.sum(axis=1)
+    table_display = table.reset_index().copy()
+    for col in table_display.columns:
+        if col != "Bulan":
+            table_display[col] = table_display[col].apply(compact_rp)
+    display_df(table_display)
+
+    with st.expander("Lihat nominal penuh"):
+        detail_table = table.reset_index().copy()
+        for col in detail_table.columns:
+            if col != "Bulan":
+                detail_table[col] = detail_table[col].apply(full_rp)
+        display_df(detail_table)
+
+    st.subheader("Ranking Kategori Belanja")
+    category_rank = category_total.reset_index()
+    category_rank.columns = ["Kategori", "Nominal"]
+    category_rank["Nominal Ringkas"] = category_rank["Nominal"].apply(compact_rp)
+    category_rank["Porsi"] = category_rank["Nominal"].apply(lambda x: f"{(x / total_spending * 100):.1f}%" if total_spending else "0%")
+    display_df(category_rank[["Kategori", "Nominal Ringkas", "Porsi"]])
+
+    with st.expander("Data long format / siap pivot"):
+        long_display = grouped.copy()
+        long_display["Nominal Ringkas"] = long_display["Nominal"].apply(compact_rp)
+        long_display["Nominal Detail"] = long_display["Nominal"].apply(full_rp)
+        display_df(long_display[["Bulan", "Kategori", "Nominal Ringkas", "Nominal Detail"]])
+
+    c1, c2 = st.columns(2)
+    c1.download_button(
+        "Download Pivot CSV",
+        data=to_csv_bytes(table.reset_index()),
+        file_name="pergerakan_belanja_bulanan_pivot.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    c2.download_button(
+        "Download Long CSV",
+        data=to_csv_bytes(grouped),
+        file_name="pergerakan_belanja_bulanan_long.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
 
 def page_budget(df: pd.DataFrame, budgets: pd.DataFrame) -> None:
     st.title("🧾 Budget Bulanan")
@@ -981,7 +1543,7 @@ def page_bulk_category(df: pd.DataFrame) -> None:
     st.write(f"Transaksi yang akan berubah kalau tombol diterapkan: **{len(preview)}**")
     if not preview.empty:
         show = preview.copy().head(50)
-        show["Tanggal"] = pd.to_datetime(show["date"], errors="coerce").dt.strftime("%d/%m/%Y")
+        show["Tanggal"] = show["date"].apply(format_date_id)
         show["Nominal"] = show["amount"].apply(compact_rp)
         display_df(show[["id", "Tanggal", "fund", "type", "Nominal", "category", "Kategori Usulan", "description"]].rename(columns={"fund": "Sumber Dana", "type": "Jenis", "category": "Kategori Lama", "description": "Keterangan"}))
     else:
@@ -1022,11 +1584,60 @@ def page_bulk_category(df: pd.DataFrame) -> None:
 
 def page_settings(df: pd.DataFrame) -> None:
     st.title("⚙️ Pengaturan & Info Deploy")
+    st.success("Kode aktif: v4.9 PASTI BARU — ada Sinkron Tanggal dan Pergerakan Belanja")
     st.write("Lokasi database aktif:")
     st.code(str(DB_PATH))
     st.write("Sumber dana aktif:")
     st.markdown(" ".join(f"<span class='pill'>{fund}</span>" for fund in get_fund_list(df)), unsafe_allow_html=True)
     st.info("Untuk tambah sumber dana baru, cukup input transaksi dengan nama sumber dana baru di halaman Buku Besar > edit, atau import file dengan sumber dana tersebut.")
+
+    st.subheader("Sinkron Tanggal dari Excel Awal")
+    st.caption("Ini sumber truth-nya dari file data/seed_transactions.csv atau data/Rekap Kas Rumdin.xlsx. Cocok buat kasus data lama terlanjur kebaca 04/11/2026 padahal harusnya 11/04/2026. Transaksi tambahan yang tidak ada di Excel awal tidak disentuh.")
+    seed_candidates = seed_date_repair_candidates(df)
+    if seed_candidates.empty:
+        st.success("Tanggal transaksi yang cocok dengan Excel awal sudah sinkron.")
+    else:
+        st.warning(f"Ada {len(seed_candidates)} transaksi yang tanggalnya beda dari Excel awal. Preview dulu sebelum diperbaiki.")
+        preview_seed = seed_candidates.copy()
+        preview_seed["Nominal"] = preview_seed["Nominal"].apply(compact_rp)
+        display_df(preview_seed[["id", "Tanggal Lama", "Tanggal Seharusnya", "Sumber Dana", "Jenis", "Kategori", "Keterangan", "Nominal"]])
+        confirm_seed = st.checkbox("Saya mau paksa tanggal ikut Excel awal", key="confirm_seed_date_repair")
+        if st.button("Sinkronkan Tanggal dari Excel Awal", type="primary", disabled=not confirm_seed):
+            changed = apply_seed_date_repair(seed_candidates)
+            st.success(f"Berhasil menyinkronkan {changed} tanggal dari Excel awal.")
+            st.rerun()
+
+    st.divider()
+    st.subheader("Perbaikan Tanggal Ketuker")
+    st.caption("Pakai ini sekali saja kalau data lama terlanjur kebaca MM/DD/YYYY. Contoh salah: 11/04/2026 tampil sebagai 04/11/2026. Perbaikan akan mengubah 2026-11-04 menjadi 2026-04-11.")
+    if df.empty:
+        st.info("Belum ada transaksi untuk dicek.")
+    else:
+        inferred_month = infer_swapped_source_month(df)
+        months = list(range(1, 13))
+        default_index = months.index(inferred_month) if inferred_month in months else int(date.today().month) - 1
+        correct_month = st.selectbox(
+            "Bulan yang benar untuk data yang ketuker",
+            months,
+            index=default_index,
+            format_func=lambda x: f"{x:02d} - {MONTH_NAMES_ID[x]}",
+            help="Kalau contoh lo 11/4/2026 harusnya 11 April 2026, pilih 04 - April.",
+        )
+        candidates = swapped_date_candidates(df, int(correct_month))
+        if candidates.empty:
+            st.success("Tidak ada kandidat tanggal ketuker untuk bulan ini.")
+        else:
+            st.warning(f"Ditemukan {len(candidates)} kandidat tanggal yang kemungkinan ketuker. Cek preview dulu sebelum klik perbaiki.")
+            preview = candidates.copy()
+            preview["Nominal"] = preview["Nominal"].apply(compact_rp)
+            display_df(preview[["id", "Tanggal Lama", "Tanggal Baru", "Sumber Dana", "Jenis", "Kategori", "Keterangan", "Nominal"]])
+            with st.expander("Detail ISO yang akan diubah"):
+                display_df(candidates[["id", "date_lama_iso", "date_baru_iso", "Keterangan"]])
+            confirm = st.checkbox("Saya sudah cek preview dan ingin memperbaiki tanggal di atas")
+            if st.button("Perbaiki tanggal ketuker", type="primary", disabled=not confirm):
+                changed = apply_swapped_date_fix(candidates)
+                st.success(f"Berhasil memperbaiki {changed} tanggal.")
+                st.rerun()
 
     st.subheader("Catatan Penyimpanan")
     st.markdown(
@@ -1046,13 +1657,15 @@ def main() -> None:
     df = fetch_transactions()
     budgets = fetch_budgets()
 
-    st.sidebar.title("🏠 Kas Rumdin")
+    st.sidebar.title("🏠 V.4 Padebuolo Next")
     page = st.sidebar.radio(
         "Menu",
-        ["Dashboard", "Input Transaksi", "Buku Besar", "Kategorisasi Massal", "Budget Bulanan", "Import / Export", "Pengaturan"],
+        ["Dashboard", "Input Transaksi", "Buku Besar", "Pergerakan Belanja", "Kategorisasi Massal", "Budget Bulanan", "Import / Export", "Pengaturan"],
     )
     st.sidebar.divider()
-    st.sidebar.caption("Default password: rumdin123")
+    st.sidebar.caption(f"{APP_VERSION} | Format tanggal: DD/MM/YYYY | Default password: rumdin123")
+    st.sidebar.warning("CEK: kalau tulisan v4.9 ini muncul, app.py yang baru sudah kebaca.")
+    st.sidebar.success("✅ Menu Pergerakan Belanja aktif di kode ini")
     if st.sidebar.button("Logout"):
         st.session_state.pop("authenticated", None)
         st.rerun()
@@ -1063,6 +1676,8 @@ def main() -> None:
         page_input(df)
     elif page == "Buku Besar":
         page_ledger(df)
+    elif page == "Pergerakan Belanja":
+        page_monthly_category(df)
     elif page == "Kategorisasi Massal":
         page_bulk_category(df)
     elif page == "Budget Bulanan":
