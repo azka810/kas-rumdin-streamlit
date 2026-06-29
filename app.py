@@ -1,4 +1,4 @@
-
+# FINAL FILE - V4.9 PASTI BARU - DD/MM/YYYY + PERGERAKAN BELANJA + SINKRON TANGGAL
 from __future__ import annotations
 
 import io
@@ -14,7 +14,7 @@ import pandas as pd
 import streamlit as st
 
 APP_TITLE = "V.4 Padebuolo Next"
-APP_VERSION = "v4.9 PASTI BARU - DD/MM/YYYY + Pergerakan Belanja + Sinkron Tanggal"
+APP_VERSION = "V.4 Padebuolo Next"
 DEFAULT_PASSWORD = "rumdin123"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -1058,7 +1058,7 @@ def render_login() -> bool:
     if st.session_state.get("authenticated"):
         return True
     st.title("🏠 V.4 Padebuolo Next")
-    st.caption("Masuk dulu pak. Default password: rumdin123, bisa diganti di secrets/env APP_PASSWORD.")
+    st.caption("Masuk dulu pak.")
     with st.form("login_form"):
         user_input = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Masuk", type="primary")
@@ -1663,8 +1663,7 @@ def main() -> None:
         ["Dashboard", "Input Transaksi", "Buku Besar", "Pergerakan Belanja", "Kategorisasi Massal", "Budget Bulanan", "Import / Export", "Pengaturan"],
     )
     st.sidebar.divider()
-    st.sidebar.caption(f"{APP_VERSION} | Format tanggal: DD/MM/YYYY | Default password: rumdin123")
-    st.sidebar.warning("CEK: kalau tulisan v4.9 ini muncul, app.py yang baru sudah kebaca.")
+    st.sidebar.caption(f"{APP_VERSION}")
     st.sidebar.success("✅ Menu Pergerakan Belanja aktif di kode ini")
     if st.sidebar.button("Logout"):
         st.session_state.pop("authenticated", None)
