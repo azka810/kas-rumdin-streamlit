@@ -12,6 +12,7 @@ import pandas as pd
 import streamlit as st
 
 APP_TITLE = "Kas Rumah Dinas"
+APP_VERSION = "v4.1 - Pergerakan Belanja"
 DEFAULT_PASSWORD = "rumdin123"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -431,6 +432,28 @@ def display_df(df: pd.DataFrame, use_container_width: bool = True) -> None:
     st.dataframe(df, use_container_width=use_container_width, hide_index=True)
 
 
+def get_balance_by_fund_label(df: pd.DataFrame, label: str) -> int:
+    """Return current balance for a fund label using exact or loose matching."""
+    if df.empty:
+        return 0
+    fund_balance = summarize(df)["fund_balance"]
+    if fund_balance.empty:
+        return 0
+
+    target = label.strip().lower()
+    fb = fund_balance.copy()
+    fb["fund_norm"] = fb["fund"].astype(str).str.strip().str.lower()
+
+    exact = fb[fb["fund_norm"] == target]
+    if not exact.empty:
+        return int(exact["saldo"].sum())
+
+    loose = fb[fb["fund_norm"].str.contains(target, na=False)]
+    if not loose.empty:
+        return int(loose["saldo"].sum())
+    return 0
+
+
 def ledger_view(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
@@ -442,10 +465,9 @@ def ledger_view(df: pd.DataFrame) -> pd.DataFrame:
     out["Masuk"] = out.apply(lambda r: compact_rp(r["amount"]) if r["type"] == "Masuk" else "-", axis=1)
     out["Keluar"] = out.apply(lambda r: compact_rp(r["amount"]) if r["type"] == "Keluar" else "-", axis=1)
     out["Netto"] = out["netto"].apply(compact_rp)
-    out["Sisa Kas"] = out["running_balance"].apply(compact_rp)
     out["Metode"] = out["method"].fillna("Kas")
     out["Catatan"] = out["note"].fillna("")
-    return out[["id", "Tanggal", "Sumber Dana", "Kategori", "Keterangan", "Masuk", "Keluar", "Netto", "Sisa Kas", "Metode", "Catatan"]]
+    return out[["id", "Tanggal", "Sumber Dana", "Kategori", "Keterangan", "Masuk", "Keluar", "Netto", "Metode", "Catatan"]]
 
 
 def detail_ledger_view(df: pd.DataFrame) -> pd.DataFrame:
@@ -456,11 +478,43 @@ def detail_ledger_view(df: pd.DataFrame) -> pd.DataFrame:
     out["Masuk Detail"] = out.apply(lambda r: full_rp(r["amount"]) if r["type"] == "Masuk" else "-", axis=1)
     out["Keluar Detail"] = out.apply(lambda r: full_rp(r["amount"]) if r["type"] == "Keluar" else "-", axis=1)
     out["Netto Detail"] = out["netto"].apply(full_rp)
-    out["Sisa Kas Detail"] = out["running_balance"].apply(full_rp)
-    return out[["id", "Tanggal", "fund", "category", "description", "Masuk Detail", "Keluar Detail", "Netto Detail", "Sisa Kas Detail", "method", "note"]].rename(
+    return out[["id", "Tanggal", "fund", "category", "description", "Masuk Detail", "Keluar Detail", "Netto Detail", "method", "note"]].rename(
         columns={"fund": "Sumber Dana", "category": "Kategori", "description": "Keterangan", "method": "Metode", "note": "Catatan"}
     )
 
+
+
+def monthly_category_summary(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Return monthly spending by category in long and pivot format."""
+    if df.empty:
+        empty_long = pd.DataFrame(columns=["Bulan", "Kategori", "Nominal"])
+        empty_pivot = pd.DataFrame()
+        return empty_long, empty_pivot
+
+    out = df[df["type"] == "Keluar"].copy()
+    if out.empty:
+        empty_long = pd.DataFrame(columns=["Bulan", "Kategori", "Nominal"])
+        empty_pivot = pd.DataFrame()
+        return empty_long, empty_pivot
+
+    out["tanggal_dt"] = pd.to_datetime(out["date"], errors="coerce")
+    out = out.dropna(subset=["tanggal_dt"])
+    if out.empty:
+        empty_long = pd.DataFrame(columns=["Bulan", "Kategori", "Nominal"])
+        empty_pivot = pd.DataFrame()
+        return empty_long, empty_pivot
+
+    out["Bulan"] = out["tanggal_dt"].dt.to_period("M").astype(str)
+    out["Kategori"] = out["category"].fillna("Lainnya").astype(str)
+    grouped = (
+        out.groupby(["Bulan", "Kategori"], as_index=False)["amount"]
+        .sum()
+        .rename(columns={"amount": "Nominal"})
+        .sort_values(["Bulan", "Kategori"])
+    )
+    pivot = grouped.pivot_table(index="Bulan", columns="Kategori", values="Nominal", aggfunc="sum", fill_value=0).sort_index()
+    pivot = pivot.astype(int)
+    return grouped, pivot
 
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
@@ -490,6 +544,12 @@ def export_excel_bytes() -> bytes:
             fb["saldo_detail"] = fb["saldo"].apply(full_rp)
             fb.to_excel(writer, sheet_name="Saldo Kas", index=False)
         budgets.to_excel(writer, sheet_name="Budget Bulanan", index=False)
+        monthly_long, monthly_pivot = monthly_category_summary(tx)
+        if not monthly_long.empty:
+            monthly_long_export = monthly_long.copy()
+            monthly_long_export["Nominal Detail"] = monthly_long_export["Nominal"].apply(full_rp)
+            monthly_long_export.to_excel(writer, sheet_name="Belanja Bulanan", index=False)
+            monthly_pivot.to_excel(writer, sheet_name="Pivot Belanja Bulanan")
         raw = tx.drop(columns=["netto", "running_balance"], errors="ignore")
         raw.to_excel(writer, sheet_name="Raw Transactions", index=False)
     return buffer.getvalue()
@@ -767,6 +827,16 @@ def page_ledger(df: pd.DataFrame) -> None:
         st.info("Belum ada transaksi.")
         return
 
+    st.subheader("Rekap Sisa Kas")
+    azka_balance = get_balance_by_fund_label(df, "Azka")
+    rayhan_balance = get_balance_by_fund_label(df, "Rayhan")
+    total_balance = summarize(df)["saldo"]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Sisa Kas Azka", compact_rp(azka_balance), help=full_rp(azka_balance))
+    c2.metric("Sisa Kas Rayhan", compact_rp(rayhan_balance), help=full_rp(rayhan_balance))
+    c3.metric("Total Sisa Kas", compact_rp(total_balance), help=full_rp(total_balance))
+    st.caption("Rekap sisa kas dihitung dari seluruh transaksi masuk dikurangi keluar per sumber dana. Tabel buku besar di bawah hanya menampilkan transaksi, bukan saldo berjalan per baris.")
+
     filters = st.container(border=True)
     with filters:
         c1, c2, c3, c4 = st.columns([1, 1, 1, 1.4])
@@ -787,7 +857,7 @@ def page_ledger(df: pd.DataFrame) -> None:
         kw = keyword.strip().lower()
         fdf = fdf[fdf["description"].str.lower().str.contains(kw, na=False) | fdf["note"].fillna("").str.lower().str.contains(kw, na=False)]
 
-    st.caption("Kolom Sisa Kas = saldo berjalan per sumber dana setelah transaksi tersebut.")
+    st.caption("Buku besar transaksi: Masuk, Keluar, dan Netto. Sisa kas ditaruh sebagai rekap di atas supaya tidak membingungkan per baris.")
     display_df(ledger_view(fdf))
 
     with st.expander("Lihat nominal penuh"):
@@ -840,6 +910,122 @@ def page_ledger(df: pd.DataFrame) -> None:
         st.warning("Transaksi dihapus.")
         st.rerun()
 
+
+
+def page_monthly_category(df: pd.DataFrame) -> None:
+    st.title("📊 Pergerakan Belanja Bulanan per Kategori")
+    st.caption("Menu ini khusus membaca transaksi jenis Keluar, lalu mengelompokkan pengeluaran per bulan dan kategori belanja.")
+
+    if df.empty:
+        st.info("Belum ada transaksi.")
+        return
+
+    out = df[df["type"] == "Keluar"].copy()
+    if out.empty:
+        st.info("Belum ada transaksi pengeluaran.")
+        return
+
+    out["tanggal_dt"] = pd.to_datetime(out["date"], errors="coerce")
+    out = out.dropna(subset=["tanggal_dt"])
+    if out.empty:
+        st.warning("Tanggal transaksi belum bisa dibaca. Cek format tanggal di data transaksi.")
+        return
+
+    out["Bulan"] = out["tanggal_dt"].dt.to_period("M").astype(str)
+    available_months = sorted(out["Bulan"].dropna().astype(str).unique().tolist())
+    available_categories = sorted(out["category"].fillna("Lainnya").astype(str).unique().tolist())
+
+    with st.container(border=True):
+        c1, c2, c3, c4 = st.columns([1, 1, 1.3, 1])
+        start_month = c1.selectbox("Dari bulan", available_months, index=0)
+        end_month = c2.selectbox("Sampai bulan", available_months, index=len(available_months) - 1)
+        selected_categories = c3.multiselect("Kategori", available_categories, default=available_categories)
+        selected_fund = c4.selectbox("Sumber dana", ["Semua"] + get_fund_list(df), index=0)
+
+    if start_month > end_month:
+        st.error("Bulan awal tidak boleh lebih besar dari bulan akhir.")
+        return
+
+    fdf = out[(out["Bulan"] >= start_month) & (out["Bulan"] <= end_month)].copy()
+    if selected_fund != "Semua":
+        fdf = fdf[fdf["fund"] == selected_fund]
+    if selected_categories:
+        fdf = fdf[fdf["category"].isin(selected_categories)]
+    else:
+        st.warning("Pilih minimal satu kategori.")
+        return
+
+    if fdf.empty:
+        st.info("Tidak ada pengeluaran sesuai filter.")
+        return
+
+    grouped, pivot = monthly_category_summary(fdf)
+    total_spending = int(fdf["amount"].sum())
+    monthly_total = pivot.sum(axis=1).sort_values(ascending=False) if not pivot.empty else pd.Series(dtype="int64")
+    category_total = pivot.sum(axis=0).sort_values(ascending=False) if not pivot.empty else pd.Series(dtype="int64")
+
+    biggest_month = monthly_total.index[0] if not monthly_total.empty else "-"
+    biggest_month_value = int(monthly_total.iloc[0]) if not monthly_total.empty else 0
+    biggest_category = category_total.index[0] if not category_total.empty else "-"
+    biggest_category_value = int(category_total.iloc[0]) if not category_total.empty else 0
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Belanja", compact_rp(total_spending), help=full_rp(total_spending))
+    c2.metric("Bulan Belanja Tertinggi", biggest_month, help=full_rp(biggest_month_value))
+    c3.metric("Kategori Terbesar", biggest_category, help=full_rp(biggest_category_value))
+
+    st.divider()
+    st.subheader("Grafik Pergerakan Bulanan")
+    chart_type = st.radio("Jenis grafik", ["Line chart", "Bar chart"], horizontal=True)
+    if chart_type == "Line chart":
+        st.line_chart(pivot)
+    else:
+        st.bar_chart(pivot)
+
+    st.subheader("Tabel Belanja Bulanan per Kategori")
+    table = pivot.copy()
+    table["Total"] = table.sum(axis=1)
+    table_display = table.reset_index().copy()
+    for col in table_display.columns:
+        if col != "Bulan":
+            table_display[col] = table_display[col].apply(compact_rp)
+    display_df(table_display)
+
+    with st.expander("Lihat nominal penuh"):
+        detail_table = table.reset_index().copy()
+        for col in detail_table.columns:
+            if col != "Bulan":
+                detail_table[col] = detail_table[col].apply(full_rp)
+        display_df(detail_table)
+
+    st.subheader("Ranking Kategori Belanja")
+    category_rank = category_total.reset_index()
+    category_rank.columns = ["Kategori", "Nominal"]
+    category_rank["Nominal Ringkas"] = category_rank["Nominal"].apply(compact_rp)
+    category_rank["Porsi"] = category_rank["Nominal"].apply(lambda x: f"{(x / total_spending * 100):.1f}%" if total_spending else "0%")
+    display_df(category_rank[["Kategori", "Nominal Ringkas", "Porsi"]])
+
+    with st.expander("Data long format / siap pivot"):
+        long_display = grouped.copy()
+        long_display["Nominal Ringkas"] = long_display["Nominal"].apply(compact_rp)
+        long_display["Nominal Detail"] = long_display["Nominal"].apply(full_rp)
+        display_df(long_display[["Bulan", "Kategori", "Nominal Ringkas", "Nominal Detail"]])
+
+    c1, c2 = st.columns(2)
+    c1.download_button(
+        "Download Pivot CSV",
+        data=to_csv_bytes(table.reset_index()),
+        file_name="pergerakan_belanja_bulanan_pivot.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    c2.download_button(
+        "Download Long CSV",
+        data=to_csv_bytes(grouped),
+        file_name="pergerakan_belanja_bulanan_long.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
 
 def page_budget(df: pd.DataFrame, budgets: pd.DataFrame) -> None:
     st.title("🧾 Budget Bulanan")
@@ -1049,10 +1235,10 @@ def main() -> None:
     st.sidebar.title("🏠 Kas Rumdin")
     page = st.sidebar.radio(
         "Menu",
-        ["Dashboard", "Input Transaksi", "Buku Besar", "Kategorisasi Massal", "Budget Bulanan", "Import / Export", "Pengaturan"],
+        ["Dashboard", "Input Transaksi", "Buku Besar", "Pergerakan Belanja", "Kategorisasi Massal", "Budget Bulanan", "Import / Export", "Pengaturan"],
     )
     st.sidebar.divider()
-    st.sidebar.caption("Default password: rumdin123")
+    st.sidebar.caption(f"{APP_VERSION} | Default password: rumdin123")
     if st.sidebar.button("Logout"):
         st.session_state.pop("authenticated", None)
         st.rerun()
@@ -1063,6 +1249,8 @@ def main() -> None:
         page_input(df)
     elif page == "Buku Besar":
         page_ledger(df)
+    elif page == "Pergerakan Belanja":
+        page_monthly_category(df)
     elif page == "Kategorisasi Massal":
         page_bulk_category(df)
     elif page == "Budget Bulanan":
