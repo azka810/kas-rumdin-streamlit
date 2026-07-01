@@ -1,4 +1,3 @@
-# FINAL FILE - V5.1 BUDGET PADEBUOLO FIX - DD/MM/YYYY + PERGERAKAN BELANJA
 from __future__ import annotations
 
 import io
@@ -14,7 +13,7 @@ import pandas as pd
 import streamlit as st
 
 APP_TITLE = "V.4 Padebuolo Next"
-APP_VERSION = "V.5.2 Padebuolo Next - Budget TypeError Fix"
+APP_VERSION = "V.5.3 Padebuolo Next - AI Assistant"
 DEFAULT_PASSWORD = "rumdin123"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -40,6 +39,8 @@ CATEGORIES = [
 ]
 METHODS = ["Kas", "Transfer", "QRIS", "Lainnya"]
 DEFAULT_FUNDS = ["Kas Rayhan", "Kas Azka"]
+AI_MODEL_DEFAULT = "gpt-4.1-mini"
+AI_LOGO_CANDIDATES = [BASE_DIR / "ai_assistant_logo.png", BASE_DIR / "assets" / "ai_assistant_logo.png"]
 
 DEFAULT_BUDGETS = [
     ("Kas Rayhan", "Sewa", 200_000),
@@ -1486,6 +1487,261 @@ def page_monthly_category(df: pd.DataFrame) -> None:
         use_container_width=True,
     )
 
+
+def get_openai_model() -> str:
+    return get_config_value("OPENAI_MODEL", AI_MODEL_DEFAULT) or AI_MODEL_DEFAULT
+
+
+def get_openai_key() -> str:
+    return get_config_value("OPENAI_API_KEY", "").strip()
+
+
+def get_ai_logo_path() -> Path | None:
+    for path in AI_LOGO_CANDIDATES:
+        try:
+            if path.exists():
+                return path
+        except Exception:
+            pass
+    return None
+
+
+def df_records_for_ai(df: pd.DataFrame, max_rows: int = 80) -> List[Dict[str, Any]]:
+    if df.empty:
+        return []
+    cols = [c for c in ["date", "fund", "type", "amount", "category", "description", "method", "note"] if c in df.columns]
+    out = df.sort_values(["date", "id"], ascending=[False, False]).head(max_rows)[cols].copy()
+    if "date" in out.columns:
+        out["date"] = out["date"].apply(format_date_id)
+    if "amount" in out.columns:
+        out["amount"] = out["amount"].apply(lambda x: int(clean_amount(x)))
+    return out.to_dict(orient="records")
+
+
+def ai_context_payload(df: pd.DataFrame, budgets: pd.DataFrame) -> Dict[str, Any]:
+    summary = summarize(df)
+    payload: Dict[str, Any] = {
+        "app": APP_TITLE,
+        "format_tanggal": "DD/MM/YYYY",
+        "catatan": "AI Assistant hanya membaca data dan memberi insight. AI tidak mengubah transaksi, budget, atau database.",
+        "ringkasan_kas": {
+            "total_masuk": int(summary.get("total_in", 0)),
+            "total_keluar": int(summary.get("total_out", 0)),
+            "saldo_total": int(summary.get("saldo", 0)),
+        },
+        "saldo_per_sumber_dana": [],
+        "budget_bulanan": [],
+        "belanja_bulanan_per_kategori": [],
+        "belanja_per_kategori_total": [],
+        "transaksi_terbaru": df_records_for_ai(df, 80),
+    }
+
+    if not df.empty and "date" in df.columns:
+        dates = df["date"].apply(parse_any_date).dropna()
+        if not dates.empty:
+            payload["rentang_data"] = {
+                "mulai": format_date_id(dates.min()),
+                "sampai": format_date_id(dates.max()),
+                "jumlah_transaksi": int(len(df)),
+            }
+
+    fund_balance = summary.get("fund_balance", pd.DataFrame())
+    if isinstance(fund_balance, pd.DataFrame) and not fund_balance.empty:
+        payload["saldo_per_sumber_dana"] = [
+            {"sumber_dana": str(r["fund"]), "saldo": int(r["saldo"])}
+            for _, r in fund_balance.iterrows()
+        ]
+
+    if not budgets.empty:
+        budget_rows = budgets.copy()
+        budget_rows["amount"] = budget_rows["amount"].apply(clean_amount)
+        payload["budget_bulanan"] = [
+            {"orang": str(r["person"]), "komponen": str(r["component"]), "budget": int(r["amount"])}
+            for _, r in budget_rows.iterrows()
+        ]
+        payload["total_budget_bulanan"] = int(budget_rows["amount"].sum())
+
+    monthly_long, _pivot = monthly_category_summary(df)
+    if not monthly_long.empty:
+        payload["belanja_bulanan_per_kategori"] = [
+            {"bulan": str(r["Bulan"]), "kategori": str(r["Kategori"]), "nominal": int(r["Nominal"])}
+            for _, r in monthly_long.iterrows()
+        ]
+    category_out = summary.get("category_out", pd.DataFrame())
+    if isinstance(category_out, pd.DataFrame) and not category_out.empty:
+        payload["belanja_per_kategori_total"] = [
+            {"kategori": str(r["category"]), "nominal": int(r["keluar"])}
+            for _, r in category_out.iterrows()
+        ]
+
+    return payload
+
+
+def local_ai_fallback_answer(question: str, df: pd.DataFrame, budgets: pd.DataFrame) -> str:
+    """Fallback insight kalau OPENAI_API_KEY belum dipasang."""
+    summary = summarize(df)
+    lines = [
+        "Mode lokal aktif karena OPENAI_API_KEY belum dipasang. Ini ringkasan otomatis tanpa API:",
+        "",
+        f"- Total masuk: {full_rp(summary.get('total_in', 0))}",
+        f"- Total keluar: {full_rp(summary.get('total_out', 0))}",
+        f"- Sisa kas total: {full_rp(summary.get('saldo', 0))}",
+    ]
+    fb = summary.get("fund_balance", pd.DataFrame())
+    if isinstance(fb, pd.DataFrame) and not fb.empty:
+        lines.append("")
+        lines.append("Saldo per sumber dana:")
+        for _, row in fb.iterrows():
+            lines.append(f"- {row['fund']}: {full_rp(row['saldo'])}")
+
+    cat = summary.get("category_out", pd.DataFrame())
+    if isinstance(cat, pd.DataFrame) and not cat.empty:
+        lines.append("")
+        lines.append("Kategori belanja terbesar:")
+        for _, row in cat.head(5).iterrows():
+            lines.append(f"- {row['category']}: {full_rp(row['keluar'])}")
+
+    if not budgets.empty:
+        total_budget = int(budgets["amount"].sum())
+        saldo = int(summary.get("saldo", 0))
+        lines.append("")
+        lines.append(f"Total budget bulanan: {full_rp(total_budget)}")
+        if total_budget > 0:
+            lines.append(f"Estimasi kas bertahan sekitar {saldo / total_budget:.1f} bulan.")
+
+    lines.append("")
+    lines.append("Supaya bisa jawab pertanyaan bebas seperti chat AI, pasang OPENAI_API_KEY di Streamlit Secrets.")
+    return "\n".join(lines)
+
+
+def call_openai_ai_assistant(question: str, df: pd.DataFrame, budgets: pd.DataFrame) -> str:
+    api_key = get_openai_key()
+    if not api_key:
+        return local_ai_fallback_answer(question, df, budgets)
+
+    context_payload = ai_context_payload(df, budgets)
+    system_prompt = """
+Kamu adalah AI Assistant untuk aplikasi kas rumah dinas bernama Padebuolo Next.
+Tugasmu membaca ringkasan transaksi, budget, saldo, dan belanja bulanan yang diberikan dalam konteks JSON.
+Jawab dalam bahasa Indonesia yang santai, jelas, dan praktis seperti ngobrol dengan pemilik kas.
+Jangan mengarang data di luar konteks. Kalau data tidak cukup, bilang data belum cukup.
+Jangan memberi instruksi untuk mengubah database kecuali berupa saran. Kamu tidak punya izin melakukan update/delete transaksi.
+Prioritaskan jawaban dengan angka rupiah, ringkasan insight, dan langkah praktis.
+Format tanggal harus DD/MM/YYYY.
+""".strip()
+
+    user_payload = {
+        "pertanyaan_user": question,
+        "data_kas": context_payload,
+    }
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key)
+        response = client.responses.create(
+            model=get_openai_model(),
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False, default=str)},
+            ],
+            max_output_tokens=1200,
+        )
+        text = getattr(response, "output_text", None)
+        if text:
+            return str(text).strip()
+
+        # Fallback extraction for SDK variants.
+        chunks: List[str] = []
+        for item in getattr(response, "output", []) or []:
+            for content in getattr(item, "content", []) or []:
+                maybe_text = getattr(content, "text", None)
+                if maybe_text:
+                    chunks.append(str(maybe_text))
+        return "\n".join(chunks).strip() or "AI belum mengembalikan jawaban. Coba ulangi pertanyaannya."
+    except Exception as exc:
+        return (
+            "Gagal memanggil OpenAI API. Cek OPENAI_API_KEY, OPENAI_MODEL, billing, atau requirements.txt.\n\n"
+            f"Detail teknis: {type(exc).__name__}: {exc}"
+        )
+
+
+def page_ai_assistant(df: pd.DataFrame, budgets: pd.DataFrame) -> None:
+    st.title("🤖 AI Assistant")
+    logo_path = get_ai_logo_path()
+    c_logo, c_text = st.columns([0.25, 0.75])
+    with c_logo:
+        if logo_path:
+            st.image(str(logo_path), use_container_width=True)
+        else:
+            st.markdown("# 🤖")
+    with c_text:
+        st.markdown("### Asisten baca data kas Padebuolo")
+        st.caption("Tanya pengeluaran, saldo, budget, kategori boros, atau minta ringkasan bulanan. Mode ini read-only: AI tidak mengubah transaksi.")
+
+    api_key = get_openai_key()
+    if not api_key:
+        st.warning("OPENAI_API_KEY belum dipasang. AI Assistant akan jalan dalam mode ringkasan lokal. Untuk chat AI penuh, isi OPENAI_API_KEY di Streamlit Secrets.")
+    else:
+        st.success(f"OpenAI API aktif. Model: {get_openai_model()}")
+
+    with st.expander("Contoh pertanyaan"):
+        examples = [
+            "Ringkas kondisi kas rumah dinas sekarang.",
+            "Bulan apa pengeluaran paling besar dan kategori apa penyebabnya?",
+            "Sisa kas Azka dan Rayhan masing-masing aman nggak?",
+            "Kategori belanja mana yang paling boros dan saran hematnya apa?",
+            "Bandingkan realisasi belanja dengan budget bulanan.",
+            "Transaksi yang masih Lainnya sebaiknya dikategorikan apa?",
+        ]
+        st.write("\n".join([f"- {x}" for x in examples]))
+
+    if "ai_messages" not in st.session_state:
+        st.session_state.ai_messages = []
+
+    quick_cols = st.columns(4)
+    quick_prompts = [
+        ("Ringkasan kas", "Ringkas kondisi kas rumah dinas sekarang, termasuk total masuk, total keluar, sisa kas per orang, dan hal yang perlu diperhatikan."),
+        ("Kategori boros", "Kategori belanja mana yang paling besar? Jelaskan penyebab yang terlihat dari data dan beri saran hemat."),
+        ("Budget check", "Bandingkan saldo dan belanja dengan budget bulanan Rayhan dan Azka. Kas masih aman berapa bulan?"),
+        ("Cek Lainnya", "Cek transaksi kategori Lainnya. Beri saran keyword/kategori yang bisa dipakai untuk kategorisasi massal."),
+    ]
+    for col, (label, prompt) in zip(quick_cols, quick_prompts):
+        if col.button(label, use_container_width=True):
+            st.session_state.ai_pending_question = prompt
+
+    st.divider()
+    for msg in st.session_state.ai_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    question = st.chat_input("Tanya AI soal kas rumah dinas...")
+    pending = st.session_state.pop("ai_pending_question", None)
+    if pending and not question:
+        question = pending
+
+    if question:
+        st.session_state.ai_messages.append({"role": "user", "content": question})
+        with st.chat_message("user"):
+            st.markdown(question)
+        with st.chat_message("assistant"):
+            with st.spinner("AI lagi baca data kas..."):
+                answer = call_openai_ai_assistant(question, df, budgets)
+            st.markdown(answer)
+        st.session_state.ai_messages.append({"role": "assistant", "content": answer})
+
+    c1, c2 = st.columns(2)
+    if c1.button("Hapus riwayat chat", use_container_width=True):
+        st.session_state.ai_messages = []
+        st.rerun()
+    c2.download_button(
+        "Download konteks data untuk AI",
+        data=json.dumps(ai_context_payload(df, budgets), ensure_ascii=False, indent=2, default=str).encode("utf-8"),
+        file_name="padebuolo_ai_context.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
 def page_budget(df: pd.DataFrame, budgets: pd.DataFrame) -> None:
     st.title("🧾 Budget Bulanan")
     st.caption("Budget bulanan standar: Rayhan 715,000 dan Azka 760,000.")
@@ -1763,7 +2019,7 @@ def main() -> None:
     st.sidebar.title("🏠 V.4 Padebuolo Next")
     page = st.sidebar.radio(
         "Menu",
-        ["Dashboard", "Input Transaksi", "Buku Besar", "Pergerakan Belanja", "Kategorisasi Massal", "Budget Bulanan", "Import / Export", "Pengaturan"],
+        ["Dashboard", "Input Transaksi", "Buku Besar", "Pergerakan Belanja", "🤖 AI Assistant", "Kategorisasi Massal", "Budget Bulanan", "Import / Export", "Pengaturan"],
     )
     st.sidebar.divider()
     st.sidebar.caption(f"{APP_VERSION}")
@@ -1779,6 +2035,8 @@ def main() -> None:
         page_ledger(df)
     elif page == "Pergerakan Belanja":
         page_monthly_category(df)
+    elif page == "🤖 AI Assistant":
+        page_ai_assistant(df, budgets)
     elif page == "Kategorisasi Massal":
         page_bulk_category(df)
     elif page == "Budget Bulanan":
