@@ -13,7 +13,7 @@ import pandas as pd
 import streamlit as st
 
 APP_TITLE = "V.4 Padebuolo Next"
-APP_VERSION = "V.5.3 Padebuolo Next - AI Assistant"
+APP_VERSION = "V.5.4 Padebuolo Next - AI Assistant No ChatInput"
 DEFAULT_PASSWORD = "rumdin123"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -1669,7 +1669,7 @@ Format tanggal harus DD/MM/YYYY.
 def page_ai_assistant(df: pd.DataFrame, budgets: pd.DataFrame) -> None:
     st.title("🤖 AI Assistant")
     logo_path = get_ai_logo_path()
-    c_logo, c_text = st.columns([0.25, 0.75])
+    c_logo, c_text = st.columns([0.22, 0.78])
     with c_logo:
         if logo_path:
             st.image(str(logo_path), use_container_width=True)
@@ -1677,7 +1677,9 @@ def page_ai_assistant(df: pd.DataFrame, budgets: pd.DataFrame) -> None:
             st.markdown("# 🤖")
     with c_text:
         st.markdown("### Asisten baca data kas Padebuolo")
-        st.caption("Tanya pengeluaran, saldo, budget, kategori boros, atau minta ringkasan bulanan. Mode ini read-only: AI tidak mengubah transaksi.")
+        st.caption("Mode aman: AI hanya membaca data dan memberi insight. AI tidak bisa edit, hapus, atau mengubah database.")
+
+    st.info("Versi ini sengaja tidak memakai komponen chat bawaan Streamlit (`st.chat_input`) supaya tidak kena error dynamic import `ChatInput...js` di Streamlit Cloud.")
 
     api_key = get_openai_key()
     if not api_key:
@@ -1685,7 +1687,7 @@ def page_ai_assistant(df: pd.DataFrame, budgets: pd.DataFrame) -> None:
     else:
         st.success(f"OpenAI API aktif. Model: {get_openai_model()}")
 
-    with st.expander("Contoh pertanyaan"):
+    with st.expander("Contoh pertanyaan", expanded=False):
         examples = [
             "Ringkas kondisi kas rumah dinas sekarang.",
             "Bulan apa pengeluaran paling besar dan kategori apa penyebabnya?",
@@ -1698,6 +1700,8 @@ def page_ai_assistant(df: pd.DataFrame, budgets: pd.DataFrame) -> None:
 
     if "ai_messages" not in st.session_state:
         st.session_state.ai_messages = []
+    if "ai_question_box" not in st.session_state:
+        st.session_state.ai_question_box = ""
 
     quick_cols = st.columns(4)
     quick_prompts = [
@@ -1708,30 +1712,47 @@ def page_ai_assistant(df: pd.DataFrame, budgets: pd.DataFrame) -> None:
     ]
     for col, (label, prompt) in zip(quick_cols, quick_prompts):
         if col.button(label, use_container_width=True):
-            st.session_state.ai_pending_question = prompt
+            st.session_state.ai_question_box = prompt
+            st.rerun()
 
     st.divider()
-    for msg in st.session_state.ai_messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
 
-    question = st.chat_input("Tanya AI soal kas rumah dinas...")
-    pending = st.session_state.pop("ai_pending_question", None)
-    if pending and not question:
-        question = pending
+    with st.form("ai_assistant_form", clear_on_submit=False):
+        question = st.text_area(
+            "Tanya AI soal kas rumah dinas",
+            key="ai_question_box",
+            height=120,
+            placeholder="Contoh: Bulan April pengeluaran paling besar kategori apa?",
+        )
+        submitted = st.form_submit_button("Tanya AI", use_container_width=True)
 
-    if question:
-        st.session_state.ai_messages.append({"role": "user", "content": question})
-        with st.chat_message("user"):
-            st.markdown(question)
-        with st.chat_message("assistant"):
+    if submitted:
+        question_clean = str(question or "").strip()
+        if not question_clean:
+            st.warning("Isi pertanyaannya dulu, pak.")
+        else:
+            st.session_state.ai_messages.append({"role": "user", "content": question_clean})
             with st.spinner("AI lagi baca data kas..."):
-                answer = call_openai_ai_assistant(question, df, budgets)
-            st.markdown(answer)
-        st.session_state.ai_messages.append({"role": "assistant", "content": answer})
+                answer = call_openai_ai_assistant(question_clean, df, budgets)
+            st.session_state.ai_messages.append({"role": "assistant", "content": answer})
+            st.session_state.ai_question_box = ""
+            st.rerun()
+
+    if st.session_state.ai_messages:
+        st.markdown("### Riwayat tanya jawab")
+        for i, msg in enumerate(st.session_state.ai_messages, start=1):
+            if msg.get("role") == "user":
+                st.markdown(f"**🧑 Pertanyaan {i}:**")
+                st.markdown(f"> {msg.get('content', '')}")
+            else:
+                st.markdown("**🤖 Jawaban AI:**")
+                st.markdown(msg.get("content", ""))
+                st.divider()
+    else:
+        st.caption("Belum ada riwayat. Pilih tombol cepat atau tulis pertanyaan manual.")
 
     c1, c2 = st.columns(2)
-    if c1.button("Hapus riwayat chat", use_container_width=True):
+    if c1.button("Hapus riwayat AI", use_container_width=True):
         st.session_state.ai_messages = []
         st.rerun()
     c2.download_button(
@@ -1741,142 +1762,6 @@ def page_ai_assistant(df: pd.DataFrame, budgets: pd.DataFrame) -> None:
         mime="application/json",
         use_container_width=True,
     )
-
-def page_budget(df: pd.DataFrame, budgets: pd.DataFrame) -> None:
-    st.title("🧾 Budget Bulanan")
-    st.caption("Budget bulanan standar: Rayhan 715,000 dan Azka 760,000.")
-
-    total_budget = int(budgets["amount"].sum()) if not budgets.empty else 0
-    saldo = summarize(df)["saldo"]
-    expected_total = sum(amount for _, _, amount in DEFAULT_BUDGETS)
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Budget Bulanan", format_budget_number(total_budget))
-    c2.metric("Saldo Kas", compact_rp(saldo), help=full_rp(saldo))
-    c3.metric("Estimasi Bertahan", f"{saldo / total_budget:.1f} bulan" if total_budget > 0 else "-")
-
-    st.subheader("Rekap Budget per Orang")
-    col_rayhan, col_azka = st.columns(2)
-    with col_rayhan:
-        st.markdown("### Rayhan")
-        display_df(budget_table_for_person(budgets, "Kas Rayhan"), hide_index=True)
-    with col_azka:
-        st.markdown("### Azka")
-        display_df(budget_table_for_person(budgets, "Kas Azka"), hide_index=True)
-
-    if total_budget != expected_total:
-        st.warning(
-            "Budget saat ini belum sama dengan standar. "
-            f"Seharusnya total {format_budget_number(expected_total)}, saat ini {format_budget_number(total_budget)}."
-        )
-
-    if st.button("Reset ke Budget Standar Padebuolo", type="primary", use_container_width=True):
-        reset_standard_budgets(mark_meta=True)
-        st.success("Budget berhasil direset: Rayhan 715,000 dan Azka 760,000.")
-        st.rerun()
-
-    with st.expander("Edit manual / tambah komponen lain"):
-        st.subheader("Daftar Budget Saat Ini")
-        if budgets.empty:
-            st.info("Belum ada budget.")
-        else:
-            show = budgets.copy()
-            show["Orang"] = show["person"].map(PERSON_LABELS).fillna(show["person"])
-            show["Nominal"] = show["amount"].apply(format_budget_number)
-            display_df(show[["id", "Orang", "component", "Nominal"]].rename(columns={"component": "Komponen"}))
-
-        st.subheader("Tambah Budget")
-        funds = get_fund_list(df)
-        with st.form("budget_form", clear_on_submit=True):
-            c1, c2, c3 = st.columns([1, 1.5, 1])
-            person = c1.selectbox("Sumber dana/orang", funds)
-            component = c2.text_input("Komponen", placeholder="Sewa, listrik, internet, air, dll")
-            amount = c3.number_input("Nominal", min_value=0, step=10_000, format="%d")
-            submitted = st.form_submit_button("Tambah Budget", type="primary")
-        if submitted:
-            if not component.strip() or amount <= 0:
-                st.error("Komponen dan nominal wajib diisi.")
-            else:
-                add_budget(person, component.strip(), int(amount))
-                st.success("Budget ditambahkan.")
-                st.rerun()
-
-        if not budgets.empty:
-            st.subheader("Hapus Budget")
-            selected = st.selectbox("Pilih budget", budgets["id"].astype(int).tolist(), format_func=lambda x: f"ID {x}")
-            if st.button("Hapus Budget Terpilih"):
-                delete_budget(int(selected))
-                st.warning("Budget dihapus.")
-                st.rerun()
-
-
-def page_import_export(df: pd.DataFrame, budgets: pd.DataFrame) -> None:
-    st.title("📦 Import / Export")
-    st.subheader("Export")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.download_button("Backup JSON", data=backup_json_bytes(), file_name="backup_kas_rumdin.json", mime="application/json", use_container_width=True)
-    c2.download_button("Buku Besar CSV", data=to_csv_bytes(detail_ledger_view(df)), file_name="buku_besar_kas_rumdin.csv", mime="text/csv", use_container_width=True)
-    c3.download_button("Export Excel", data=export_excel_bytes(), file_name="rekap_kas_rumdin.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-    if DB_PATH.exists():
-        c4.download_button("Download DB", data=DB_PATH.read_bytes(), file_name="kas_rumdin.db", mime="application/octet-stream", use_container_width=True)
-
-    st.divider()
-    st.subheader("Import")
-    st.caption("Bisa import backup JSON dari app ini, CSV transaksi, atau Excel lama dengan sheet Master Kas/Biaya Bulanan.")
-    uploaded = st.file_uploader("Upload file", type=["json", "csv", "xlsx", "xls"])
-    replace = st.toggle("Replace semua data saat import", value=False, help="Kalau aktif, transaksi dan budget lama akan dihapus dulu.")
-    if uploaded is not None:
-        tx_rows: List[Dict[str, Any]] = []
-        budget_rows: List[Dict[str, Any]] = []
-        try:
-            if uploaded.name.lower().endswith(".json"):
-                payload = json.loads(uploaded.getvalue().decode("utf-8"))
-                tx_rows = payload.get("transactions", [])
-                budget_rows = payload.get("budgets", [])
-            elif uploaded.name.lower().endswith(".csv"):
-                imported_df = pd.read_csv(uploaded)
-                tx_rows = normalize_transactions_from_df(imported_df)
-            else:
-                xl = pd.ExcelFile(uploaded)
-                tx_sheet = None
-                budget_sheet = None
-                for sheet in xl.sheet_names:
-                    low = sheet.lower()
-                    if tx_sheet is None and ("trans" in low or "master" in low or "buku" in low):
-                        tx_sheet = sheet
-                    if budget_sheet is None and ("budget" in low or "biaya" in low):
-                        budget_sheet = sheet
-                if tx_sheet:
-                    tx_rows = normalize_transactions_from_df(pd.read_excel(xl, sheet_name=tx_sheet))
-                if budget_sheet:
-                    budget_rows = normalize_budgets_from_df(pd.read_excel(xl, sheet_name=budget_sheet))
-            st.info(f"Terdeteksi {len(tx_rows)} transaksi dan {len(budget_rows)} budget.")
-            with st.expander("Preview transaksi import"):
-                display_df(pd.DataFrame(tx_rows).head(20))
-            if st.button("Proses Import", type="primary"):
-                tx_count, bd_count = import_rows(tx_rows, budget_rows, replace=replace)
-                st.success(f"Import selesai: {tx_count} transaksi dan {bd_count} budget masuk.")
-                st.rerun()
-        except Exception as exc:
-            st.error(f"Gagal membaca file: {exc}")
-
-    st.divider()
-    st.subheader("Reset Data")
-    st.warning("Reset akan menghapus semua transaksi dan budget, lalu mengisi ulang data contoh dari Excel awal.")
-    confirm = st.text_input("Ketik RESET untuk konfirmasi")
-    if st.button("Reset ke Data Awal"):
-        if confirm == "RESET":
-            conn = get_conn()
-            conn.execute("DELETE FROM transactions")
-            conn.execute("DELETE FROM budgets")
-            conn.commit()
-            seed_if_empty()
-            st.success("Data sudah direset ke data awal.")
-            st.rerun()
-        else:
-            st.error("Konfirmasi belum sesuai.")
-
-
 
 def page_bulk_category(df: pd.DataFrame) -> None:
     st.title("🧠 Kategorisasi Massal")
