@@ -1,4 +1,4 @@
-# FINAL FILE - V4.9 PASTI BARU - DD/MM/YYYY + PERGERAKAN BELANJA + SINKRON TANGGAL
+
 from __future__ import annotations
 
 import io
@@ -14,7 +14,7 @@ import pandas as pd
 import streamlit as st
 
 APP_TITLE = "V.4 Padebuolo Next"
-APP_VERSION = "V.4 Padebuolo Next"
+APP_VERSION = "V.5.1 Padebuolo Next - Budget Fix"
 DEFAULT_PASSWORD = "rumdin123"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -40,6 +40,29 @@ CATEGORIES = [
 ]
 METHODS = ["Kas", "Transfer", "QRIS", "Lainnya"]
 DEFAULT_FUNDS = ["Kas Rayhan", "Kas Azka"]
+
+DEFAULT_BUDGETS = [
+    ("Kas Rayhan", "Sewa", 200_000),
+    ("Kas Rayhan", "Indihome", 165_000),
+    ("Kas Rayhan", "Listrik", 300_000),
+    ("Kas Rayhan", "Air", 50_000),
+    ("Kas Azka", "Sewa", 245_000),
+    ("Kas Azka", "Indihome", 165_000),
+    ("Kas Azka", "Listrik", 300_000),
+    ("Kas Azka", "Air", 50_000),
+]
+
+PERSON_LABELS = {
+    "Kas Rayhan": "Rayhan",
+    "Kas Azka": "Azka",
+}
+
+BUDGET_COMPONENT_ORDER = {
+    "Sewa": 1,
+    "Indihome": 2,
+    "Listrik": 3,
+    "Air": 4,
+}
 
 ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 DMY_SLASH_RE = re.compile(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$")
@@ -626,6 +649,7 @@ def init_db() -> None:
     conn.commit()
     seed_if_empty()
     auto_repair_dates_from_seed_once()
+    ensure_standard_budget_once()
 
 
 def seed_if_empty() -> None:
@@ -728,6 +752,65 @@ def add_budget(person: str, component: str, amount: int) -> None:
 
 def delete_budget(budget_id: int) -> None:
     execute("DELETE FROM budgets WHERE id=?", (budget_id,))
+
+
+def reset_standard_budgets(mark_meta: bool = True) -> None:
+    """Replace budget table with the agreed monthly budget for Rayhan and Azka."""
+    conn = get_conn()
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    with conn:
+        conn.execute("DELETE FROM budgets")
+        for person, component, amount in DEFAULT_BUDGETS:
+            conn.execute(
+                "INSERT INTO budgets(person, component, amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (person, component, int(amount), now, now),
+            )
+        if mark_meta:
+            conn.execute(
+                "INSERT OR REPLACE INTO app_meta(key, value) VALUES('standard_budget_v51_applied_at', ?)",
+                (now,),
+            )
+
+
+def ensure_standard_budget_once() -> None:
+    """One-time migration for deployed databases that still contain wrong budget rows."""
+    conn = get_conn()
+    try:
+        already = conn.execute(
+            "SELECT value FROM app_meta WHERE key='standard_budget_v51_applied_at'"
+        ).fetchone()
+        if already:
+            return
+        reset_standard_budgets(mark_meta=True)
+    except Exception:
+        pass
+
+
+def format_budget_number(value: Any) -> str:
+    try:
+        n = int(round(float(value or 0)))
+    except Exception:
+        n = 0
+    return f"{n:,}"
+
+
+def budget_table_for_person(budgets: pd.DataFrame, person: str) -> pd.DataFrame:
+    if budgets.empty:
+        base = pd.DataFrame(columns=["Komponen", "Total"])
+    else:
+        base = budgets[budgets["person"].astype(str).eq(person)].copy()
+        if base.empty:
+            base = pd.DataFrame(columns=["component", "amount"])
+        base = base[["component", "amount"]].rename(columns={"component": "Komponen", "amount": "Total"})
+    if not base.empty:
+        base["Total"] = base["Total"].apply(clean_amount)
+        base["_order"] = base["Komponen"].astype(str).map(BUDGET_COMPONENT_ORDER).fillna(99)
+        base = base.sort_values(["_order", "Komponen"]).drop(columns=["_order"])
+    total = int(base["Total"].sum()) if not base.empty else 0
+    out = base.copy()
+    out.loc[len(out)] = ["Total", total]
+    out["Total"] = out["Total"].apply(format_budget_number)
+    return out
 
 
 def fetch_transactions() -> pd.DataFrame:
@@ -1405,49 +1488,70 @@ def page_monthly_category(df: pd.DataFrame) -> None:
 
 def page_budget(df: pd.DataFrame, budgets: pd.DataFrame) -> None:
     st.title("🧾 Budget Bulanan")
-    c1, c2, c3 = st.columns(3)
+    st.caption("Budget bulanan standar: Rayhan 715,000 dan Azka 760,000.")
+
     total_budget = int(budgets["amount"].sum()) if not budgets.empty else 0
-    c1.metric("Total Budget Bulanan", compact_rp(total_budget), help=full_rp(total_budget))
     saldo = summarize(df)["saldo"]
+    expected_total = sum(amount for _, _, amount in DEFAULT_BUDGETS)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Budget Bulanan", format_budget_number(total_budget))
     c2.metric("Saldo Kas", compact_rp(saldo), help=full_rp(saldo))
     c3.metric("Estimasi Bertahan", f"{saldo / total_budget:.1f} bulan" if total_budget > 0 else "-")
 
-    st.subheader("Daftar Budget")
-    if budgets.empty:
-        st.info("Belum ada budget.")
-    else:
-        show = budgets.copy()
-        show["Nominal"] = show["amount"].apply(compact_rp)
-        display_df(show[["id", "person", "component", "Nominal"]].rename(columns={"person": "Sumber Dana", "component": "Komponen"}))
-        with st.expander("Detail nominal budget"):
-            d = budgets.copy()
-            d["Nominal Detail"] = d["amount"].apply(full_rp)
-            display_df(d[["id", "person", "component", "Nominal Detail"]].rename(columns={"person": "Sumber Dana", "component": "Komponen"}))
+    st.subheader("Rekap Budget per Orang")
+    col_rayhan, col_azka = st.columns(2)
+    with col_rayhan:
+        st.markdown("### Rayhan")
+        display_df(budget_table_for_person(budgets, "Kas Rayhan"), hide_index=True)
+    with col_azka:
+        st.markdown("### Azka")
+        display_df(budget_table_for_person(budgets, "Kas Azka"), hide_index=True)
 
-    st.divider()
-    st.subheader("Tambah Budget")
-    funds = get_fund_list(df)
-    with st.form("budget_form", clear_on_submit=True):
-        c1, c2, c3 = st.columns([1, 1.5, 1])
-        person = c1.selectbox("Sumber dana/orang", funds)
-        component = c2.text_input("Komponen", placeholder="Sewa, listrik, internet, air, dll")
-        amount = c3.number_input("Nominal", min_value=0, step=10_000, format="%d")
-        submitted = st.form_submit_button("Tambah Budget", type="primary")
-    if submitted:
-        if not component.strip() or amount <= 0:
-            st.error("Komponen dan nominal wajib diisi.")
+    if total_budget != expected_total:
+        st.warning(
+            "Budget saat ini belum sama dengan standar. "
+            f"Seharusnya total {format_budget_number(expected_total)}, saat ini {format_budget_number(total_budget)}."
+        )
+
+    if st.button("Reset ke Budget Standar Padebuolo", type="primary", use_container_width=True):
+        reset_standard_budgets(mark_meta=True)
+        st.success("Budget berhasil direset: Rayhan 715,000 dan Azka 760,000.")
+        st.rerun()
+
+    with st.expander("Edit manual / tambah komponen lain"):
+        st.subheader("Daftar Budget Saat Ini")
+        if budgets.empty:
+            st.info("Belum ada budget.")
         else:
-            add_budget(person, component.strip(), int(amount))
-            st.success("Budget ditambahkan.")
-            st.rerun()
+            show = budgets.copy()
+            show["Orang"] = show["person"].map(PERSON_LABELS).fillna(show["person"])
+            show["Nominal"] = show["amount"].apply(format_budget_number)
+            display_df(show[["id", "Orang", "component", "Nominal"]].rename(columns={"component": "Komponen"}))
 
-    if not budgets.empty:
-        st.subheader("Hapus Budget")
-        selected = st.selectbox("Pilih budget", budgets["id"].astype(int).tolist(), format_func=lambda x: f"ID {x}")
-        if st.button("Hapus Budget Terpilih"):
-            delete_budget(int(selected))
-            st.warning("Budget dihapus.")
-            st.rerun()
+        st.subheader("Tambah Budget")
+        funds = get_fund_list(df)
+        with st.form("budget_form", clear_on_submit=True):
+            c1, c2, c3 = st.columns([1, 1.5, 1])
+            person = c1.selectbox("Sumber dana/orang", funds)
+            component = c2.text_input("Komponen", placeholder="Sewa, listrik, internet, air, dll")
+            amount = c3.number_input("Nominal", min_value=0, step=10_000, format="%d")
+            submitted = st.form_submit_button("Tambah Budget", type="primary")
+        if submitted:
+            if not component.strip() or amount <= 0:
+                st.error("Komponen dan nominal wajib diisi.")
+            else:
+                add_budget(person, component.strip(), int(amount))
+                st.success("Budget ditambahkan.")
+                st.rerun()
+
+        if not budgets.empty:
+            st.subheader("Hapus Budget")
+            selected = st.selectbox("Pilih budget", budgets["id"].astype(int).tolist(), format_func=lambda x: f"ID {x}")
+            if st.button("Hapus Budget Terpilih"):
+                delete_budget(int(selected))
+                st.warning("Budget dihapus.")
+                st.rerun()
 
 
 def page_import_export(df: pd.DataFrame, budgets: pd.DataFrame) -> None:
@@ -1584,7 +1688,6 @@ def page_bulk_category(df: pd.DataFrame) -> None:
 
 def page_settings(df: pd.DataFrame) -> None:
     st.title("⚙️ Pengaturan & Info Deploy")
-    st.success("Kode aktif: v4.9 PASTI BARU — ada Sinkron Tanggal dan Pergerakan Belanja")
     st.write("Lokasi database aktif:")
     st.code(str(DB_PATH))
     st.write("Sumber dana aktif:")
@@ -1664,7 +1767,6 @@ def main() -> None:
     )
     st.sidebar.divider()
     st.sidebar.caption(f"{APP_VERSION}")
-    st.sidebar.success("✅ Menu Pergerakan Belanja aktif di kode ini")
     if st.sidebar.button("Logout"):
         st.session_state.pop("authenticated", None)
         st.rerun()
