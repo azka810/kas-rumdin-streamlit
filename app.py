@@ -1,4 +1,4 @@
-
+# FINAL FILE - V5.1 BUDGET PADEBUOLO FIX - DD/MM/YYYY + PERGERAKAN BELANJA
 from __future__ import annotations
 
 import io
@@ -14,7 +14,7 @@ import pandas as pd
 import streamlit as st
 
 APP_TITLE = "V.4 Padebuolo Next"
-APP_VERSION = "V.5.1 Padebuolo Next - Budget Fix"
+APP_VERSION = "V.5.2 Padebuolo Next - Budget TypeError Fix"
 DEFAULT_PASSWORD = "rumdin123"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -870,7 +870,7 @@ def summarize(df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
-def display_df(df: pd.DataFrame, use_container_width: bool = True) -> None:
+def display_df(df: pd.DataFrame, use_container_width: bool = True, hide_index: bool = True) -> None:
     view = df.copy()
     rename_map = {}
     for col in list(view.columns):
@@ -881,7 +881,7 @@ def display_df(df: pd.DataFrame, use_container_width: bool = True) -> None:
             view[col] = view[col].apply(format_date_id)
     if rename_map:
         view = view.rename(columns=rename_map)
-    st.dataframe(view, use_container_width=use_container_width, hide_index=True)
+    st.dataframe(view, use_container_width=use_container_width, hide_index=hide_index)
 
 
 def get_balance_by_fund_label(df: pd.DataFrame, label: str) -> int:
