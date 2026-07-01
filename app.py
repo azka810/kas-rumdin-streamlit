@@ -1,3 +1,4 @@
+# FINAL FILE - V5.1 BUDGET PADEBUOLO FIX - DD/MM/YYYY + PERGERAKAN BELANJA
 from __future__ import annotations
 
 import io
@@ -13,7 +14,7 @@ import pandas as pd
 import streamlit as st
 
 APP_TITLE = "V.4 Padebuolo Next"
-APP_VERSION = "V.5.4 Padebuolo Next - AI Assistant No ChatInput"
+APP_VERSION = "V.5.5 Padebuolo Next - AI Assistant State Fix"
 DEFAULT_PASSWORD = "rumdin123"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -1735,7 +1736,6 @@ def page_ai_assistant(df: pd.DataFrame, budgets: pd.DataFrame) -> None:
             with st.spinner("AI lagi baca data kas..."):
                 answer = call_openai_ai_assistant(question_clean, df, budgets)
             st.session_state.ai_messages.append({"role": "assistant", "content": answer})
-            st.session_state.ai_question_box = ""
             st.rerun()
 
     if st.session_state.ai_messages:
