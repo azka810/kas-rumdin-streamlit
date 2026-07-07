@@ -12,9 +12,10 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 import pandas as pd
 import streamlit as st
+import requests
 
 APP_TITLE = "V.4 Padebuolo Next"
-APP_VERSION = "V.5.5 Padebuolo Next - AI Assistant State Fix"
+APP_VERSION = "V.5.7 Padebuolo Next - No AI + Import Ready + Persistent Backup"
 DEFAULT_PASSWORD = "rumdin123"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -40,8 +41,6 @@ CATEGORIES = [
 ]
 METHODS = ["Kas", "Transfer", "QRIS", "Lainnya"]
 DEFAULT_FUNDS = ["Kas Rayhan", "Kas Azka"]
-AI_MODEL_DEFAULT = "gpt-4.1-mini"
-AI_LOGO_CANDIDATES = [BASE_DIR / "ai_assistant_logo.png", BASE_DIR / "assets" / "ai_assistant_logo.png"]
 
 DEFAULT_BUDGETS = [
     ("Kas Rayhan", "Sewa", 200_000),
@@ -273,6 +272,188 @@ def get_config_value(key: str, default: str = "") -> str:
     return os.getenv(key, default)
 
 
+_REMOTE_RESTORE_IN_PROGRESS = False
+
+
+def cloud_sync_config() -> Dict[str, str]:
+    """GitHub JSON persistence config from Streamlit Secrets/env."""
+    return {
+        "provider": get_config_value("PERSISTENCE_PROVIDER", "").strip().lower(),
+        "token": get_config_value("GITHUB_TOKEN", "").strip(),
+        "repo": get_config_value("GITHUB_REPO", "").strip(),
+        "branch": get_config_value("GITHUB_BRANCH", "main").strip() or "main",
+        "path": get_config_value("GITHUB_DATA_FILE", "data/padebuolo_live_backup.json").strip() or "data/padebuolo_live_backup.json",
+    }
+
+
+def cloud_sync_enabled() -> bool:
+    cfg = cloud_sync_config()
+    provider_ok = cfg["provider"] in {"github", "git", "gh"}
+    return bool(provider_ok and cfg["token"] and cfg["repo"] and cfg["path"])
+
+
+def set_sync_status(message: str | None = None, error: str | None = None) -> None:
+    if message:
+        st.session_state["cloud_sync_last_status"] = message
+    if error:
+        st.session_state["cloud_sync_last_error"] = error
+    elif message:
+        st.session_state.pop("cloud_sync_last_error", None)
+
+
+def github_api_request(method: str, url: str, **kwargs: Any) -> requests.Response:
+    cfg = cloud_sync_config()
+    headers = kwargs.pop("headers", {}) or {}
+    headers.update({
+        "Authorization": f"Bearer {cfg['token']}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    })
+    return requests.request(method, url, headers=headers, timeout=20, **kwargs)
+
+
+def snapshot_from_local_db() -> Dict[str, Any]:
+    tx = fetch_transactions().drop(columns=["netto", "running_balance"], errors="ignore").to_dict(orient="records")
+    budgets = fetch_budgets().to_dict(orient="records")
+    return {
+        "exported_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "app": APP_TITLE,
+        "app_version": APP_VERSION,
+        "transactions": tx,
+        "budgets": budgets,
+    }
+
+
+def replace_local_db_from_snapshot(snapshot: Dict[str, Any]) -> Tuple[int, int]:
+    global _REMOTE_RESTORE_IN_PROGRESS
+    _REMOTE_RESTORE_IN_PROGRESS = True
+    try:
+        transactions = snapshot.get("transactions", []) or []
+        budgets = snapshot.get("budgets", []) or []
+        conn = get_conn()
+        now = datetime.utcnow().isoformat(timespec="seconds")
+        with conn:
+            conn.execute("DELETE FROM transactions")
+            conn.execute("DELETE FROM budgets")
+            for tx in transactions:
+                amount = clean_amount(tx.get("amount"))
+                if amount <= 0:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO transactions(date, fund, type, amount, category, description, method, note, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        parse_date(tx.get("date")),
+                        str(tx.get("fund", DEFAULT_FUNDS[0])).strip() or DEFAULT_FUNDS[0],
+                        "Masuk" if str(tx.get("type", "Keluar")).lower() == "masuk" else "Keluar",
+                        amount,
+                        str(tx.get("category", "Lainnya")).strip() or "Lainnya",
+                        str(tx.get("description", "Transaksi")).strip() or "Transaksi",
+                        str(tx.get("method", "Kas")).strip() or "Kas",
+                        "" if pd.isna(tx.get("note", "")) else str(tx.get("note", "")).strip(),
+                        now,
+                        now,
+                    ),
+                )
+            for bd in budgets:
+                amount = clean_amount(bd.get("amount"))
+                if amount <= 0:
+                    continue
+                conn.execute(
+                    "INSERT INTO budgets(person, component, amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        str(bd.get("person", DEFAULT_FUNDS[0])).strip() or DEFAULT_FUNDS[0],
+                        str(bd.get("component", "Kebutuhan")).strip() or "Kebutuhan",
+                        amount,
+                        now,
+                        now,
+                    ),
+                )
+            conn.execute("INSERT OR REPLACE INTO app_meta(key, value) VALUES('restored_from_cloud_at', ?)", (now,))
+        return len(transactions), len(budgets)
+    finally:
+        _REMOTE_RESTORE_IN_PROGRESS = False
+
+
+def load_snapshot_from_github() -> Dict[str, Any] | None:
+    if not cloud_sync_enabled():
+        return None
+    try:
+        import base64
+        cfg = cloud_sync_config()
+        url = f"https://api.github.com/repos/{cfg['repo']}/contents/{cfg['path']}"
+        resp = github_api_request("GET", url, params={"ref": cfg["branch"]})
+        if resp.status_code == 404:
+            return None
+        if resp.status_code != 200:
+            raise RuntimeError(f"GitHub GET {resp.status_code}: {resp.text[:300]}")
+        payload = resp.json()
+        raw = base64.b64decode(payload.get("content", "")).decode("utf-8")
+        return json.loads(raw)
+    except Exception as exc:
+        set_sync_status(error=f"Restore cloud gagal: {exc}")
+        return None
+
+
+def restore_from_github_if_local_empty() -> bool:
+    if not cloud_sync_enabled():
+        return False
+    try:
+        conn = get_conn()
+        count = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+        if count > 0:
+            return False
+        snapshot = load_snapshot_from_github()
+        if not snapshot:
+            return False
+        tx_count, bd_count = replace_local_db_from_snapshot(snapshot)
+        set_sync_status(f"Restore cloud berhasil: {tx_count} transaksi, {bd_count} budget.")
+        return True
+    except Exception as exc:
+        set_sync_status(error=f"Restore cloud gagal: {exc}")
+        return False
+
+
+def sync_local_db_to_github(reason: str = "update") -> bool:
+    if _REMOTE_RESTORE_IN_PROGRESS or not cloud_sync_enabled():
+        return False
+    try:
+        import base64
+        cfg = cloud_sync_config()
+        url = f"https://api.github.com/repos/{cfg['repo']}/contents/{cfg['path']}"
+        sha = None
+        get_resp = github_api_request("GET", url, params={"ref": cfg["branch"]})
+        if get_resp.status_code == 200:
+            sha = get_resp.json().get("sha")
+        elif get_resp.status_code != 404:
+            raise RuntimeError(f"GitHub GET {get_resp.status_code}: {get_resp.text[:300]}")
+
+        snapshot = snapshot_from_local_db()
+        raw = json.dumps(snapshot, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+        body = {
+            "message": f"Update Padebuolo live data ({reason})",
+            "content": base64.b64encode(raw).decode("ascii"),
+            "branch": cfg["branch"],
+        }
+        if sha:
+            body["sha"] = sha
+        put_resp = github_api_request("PUT", url, json=body)
+        if put_resp.status_code not in (200, 201):
+            raise RuntimeError(f"GitHub PUT {put_resp.status_code}: {put_resp.text[:300]}")
+        set_sync_status(f"Backup cloud tersimpan: {snapshot['exported_at']} UTC")
+        return True
+    except Exception as exc:
+        set_sync_status(error=f"Backup cloud gagal: {exc}")
+        return False
+
+
+def sync_after_write(reason: str = "update") -> None:
+    if cloud_sync_enabled():
+        sync_local_db_to_github(reason=reason)
+
+
 def compact_rp(value: Any) -> str:
     try:
         n = float(value or 0)
@@ -351,6 +532,8 @@ def recategorize_by_rules(only_lainnya: bool = True) -> int:
             conn.execute("UPDATE transactions SET category=?, updated_at=? WHERE id=?", (new_category, now, int(row["id"])))
             changed += 1
     conn.commit()
+    if changed:
+        sync_after_write(reason="recategorize_by_rules")
     return changed
 
 
@@ -373,6 +556,8 @@ def recategorize_by_keyword(keywords: List[str], new_category: str, only_lainnya
             conn.execute("UPDATE transactions SET category=?, updated_at=? WHERE id=?", (new_category, now, int(row["id"])))
             changed += 1
     conn.commit()
+    if changed:
+        sync_after_write(reason="recategorize_by_keyword")
     return changed
 
 
@@ -467,6 +652,8 @@ def apply_swapped_date_fix(candidates: pd.DataFrame) -> int:
         )
         changed += 1
     conn.commit()
+    if changed:
+        sync_after_write(reason="date_fix_swapped")
     return changed
 
 
@@ -573,6 +760,8 @@ def apply_seed_date_repair(candidates: pd.DataFrame) -> int:
         (now,),
     )
     conn.commit()
+    if changed:
+        sync_after_write(reason="date_repair_from_seed")
     return changed
 
 
@@ -649,9 +838,12 @@ def init_db() -> None:
         """
     )
     conn.commit()
+    restore_from_github_if_local_empty()
     seed_if_empty()
     auto_repair_dates_from_seed_once()
     ensure_standard_budget_once()
+    if cloud_sync_enabled():
+        sync_local_db_to_github(reason="startup")
 
 
 def seed_if_empty() -> None:
@@ -694,6 +886,69 @@ def seed_if_empty() -> None:
     conn.commit()
 
 
+def reset_db_from_seed_files() -> Tuple[int, int]:
+    """Replace all live data with data/seed_transactions.csv and data/seed_budgets.csv."""
+    tx_path = DATA_DIR / "seed_transactions.csv"
+    bd_path = DATA_DIR / "seed_budgets.csv"
+    if not tx_path.exists():
+        raise FileNotFoundError(f"File tidak ditemukan: {tx_path}")
+    if not bd_path.exists():
+        raise FileNotFoundError(f"File tidak ditemukan: {bd_path}")
+
+    tx_df = pd.read_csv(tx_path)
+    bd_df = pd.read_csv(bd_path)
+    conn = get_conn()
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    tx_count = 0
+    bd_count = 0
+    with conn:
+        conn.execute("DELETE FROM transactions")
+        conn.execute("DELETE FROM budgets")
+        for _, row in tx_df.iterrows():
+            amount = clean_amount(row.get("amount"))
+            if amount <= 0:
+                continue
+            conn.execute(
+                """
+                INSERT INTO transactions(date, fund, type, amount, category, description, method, note, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    parse_date(row.get("date")),
+                    str(row.get("fund", DEFAULT_FUNDS[0])).strip() or DEFAULT_FUNDS[0],
+                    "Masuk" if str(row.get("type", "Keluar")).lower() == "masuk" else "Keluar",
+                    amount,
+                    str(row.get("category", "Lainnya")).strip() or "Lainnya",
+                    str(row.get("description", "Transaksi")).strip() or "Transaksi",
+                    str(row.get("method", "Kas")).strip() or "Kas",
+                    "" if pd.isna(row.get("note", "")) else str(row.get("note", "")).strip(),
+                    now,
+                    now,
+                ),
+            )
+            tx_count += 1
+        for _, row in bd_df.iterrows():
+            amount = clean_amount(row.get("amount"))
+            if amount <= 0:
+                continue
+            conn.execute(
+                "INSERT INTO budgets(person, component, amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    str(row.get("person", DEFAULT_FUNDS[0])).strip() or DEFAULT_FUNDS[0],
+                    str(row.get("component", "Kebutuhan")).strip() or "Kebutuhan",
+                    amount,
+                    now,
+                    now,
+                ),
+            )
+            bd_count += 1
+        conn.execute("INSERT OR REPLACE INTO app_meta(key, value) VALUES('seed_force_reset_at', ?)", (now,))
+        conn.execute("INSERT OR REPLACE INTO app_meta(key, value) VALUES('standard_budget_v51_applied_at', ?)", (now,))
+        conn.execute("INSERT OR REPLACE INTO app_meta(key, value) VALUES('date_seed_repair_v48_applied_at', ?)", (now,))
+    sync_after_write(reason="reset_from_seed_files")
+    return tx_count, bd_count
+
+
 def run_query(query: str, params: Iterable[Any] = ()) -> List[Dict[str, Any]]:
     conn = get_conn()
     rows = conn.execute(query, tuple(params)).fetchall()
@@ -704,6 +959,7 @@ def execute(query: str, params: Iterable[Any] = ()) -> None:
     conn = get_conn()
     conn.execute(query, tuple(params))
     conn.commit()
+    sync_after_write(reason="execute")
 
 
 def add_transaction(tx_date: str, fund: str, tx_type: str, amount: int, category: str, description: str, method: str = "Kas", note: str = "") -> None:
@@ -772,6 +1028,7 @@ def reset_standard_budgets(mark_meta: bool = True) -> None:
                 "INSERT OR REPLACE INTO app_meta(key, value) VALUES('standard_budget_v51_applied_at', ?)",
                 (now,),
             )
+    sync_after_write(reason="reset_standard_budgets")
 
 
 def ensure_standard_budget_once() -> None:
@@ -1133,6 +1390,8 @@ def import_rows(transactions: List[Dict[str, Any]], budgets: List[Dict[str, Any]
         )
         bd_count += 1
     conn.commit()
+    if tx_count or bd_count:
+        sync_after_write(reason="import_rows")
     return tx_count, bd_count
 
 
@@ -1488,280 +1747,140 @@ def page_monthly_category(df: pd.DataFrame) -> None:
         use_container_width=True,
     )
 
+def page_budget(df: pd.DataFrame, budgets: pd.DataFrame) -> None:
+    st.title("🧾 Budget Bulanan")
+    st.caption("Budget bulanan standar: Rayhan 715,000 dan Azka 760,000.")
 
-def get_openai_model() -> str:
-    return get_config_value("OPENAI_MODEL", AI_MODEL_DEFAULT) or AI_MODEL_DEFAULT
+    total_budget = int(budgets["amount"].sum()) if not budgets.empty else 0
+    saldo = summarize(df)["saldo"]
+    expected_total = sum(amount for _, _, amount in DEFAULT_BUDGETS)
 
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Budget Bulanan", format_budget_number(total_budget))
+    c2.metric("Saldo Kas", compact_rp(saldo), help=full_rp(saldo))
+    c3.metric("Estimasi Bertahan", f"{saldo / total_budget:.1f} bulan" if total_budget > 0 else "-")
 
-def get_openai_key() -> str:
-    return get_config_value("OPENAI_API_KEY", "").strip()
+    st.subheader("Rekap Budget per Orang")
+    col_rayhan, col_azka = st.columns(2)
+    with col_rayhan:
+        st.markdown("### Rayhan")
+        display_df(budget_table_for_person(budgets, "Kas Rayhan"), hide_index=True)
+    with col_azka:
+        st.markdown("### Azka")
+        display_df(budget_table_for_person(budgets, "Kas Azka"), hide_index=True)
 
-
-def get_ai_logo_path() -> Path | None:
-    for path in AI_LOGO_CANDIDATES:
-        try:
-            if path.exists():
-                return path
-        except Exception:
-            pass
-    return None
-
-
-def df_records_for_ai(df: pd.DataFrame, max_rows: int = 80) -> List[Dict[str, Any]]:
-    if df.empty:
-        return []
-    cols = [c for c in ["date", "fund", "type", "amount", "category", "description", "method", "note"] if c in df.columns]
-    out = df.sort_values(["date", "id"], ascending=[False, False]).head(max_rows)[cols].copy()
-    if "date" in out.columns:
-        out["date"] = out["date"].apply(format_date_id)
-    if "amount" in out.columns:
-        out["amount"] = out["amount"].apply(lambda x: int(clean_amount(x)))
-    return out.to_dict(orient="records")
-
-
-def ai_context_payload(df: pd.DataFrame, budgets: pd.DataFrame) -> Dict[str, Any]:
-    summary = summarize(df)
-    payload: Dict[str, Any] = {
-        "app": APP_TITLE,
-        "format_tanggal": "DD/MM/YYYY",
-        "catatan": "AI Assistant hanya membaca data dan memberi insight. AI tidak mengubah transaksi, budget, atau database.",
-        "ringkasan_kas": {
-            "total_masuk": int(summary.get("total_in", 0)),
-            "total_keluar": int(summary.get("total_out", 0)),
-            "saldo_total": int(summary.get("saldo", 0)),
-        },
-        "saldo_per_sumber_dana": [],
-        "budget_bulanan": [],
-        "belanja_bulanan_per_kategori": [],
-        "belanja_per_kategori_total": [],
-        "transaksi_terbaru": df_records_for_ai(df, 80),
-    }
-
-    if not df.empty and "date" in df.columns:
-        dates = df["date"].apply(parse_any_date).dropna()
-        if not dates.empty:
-            payload["rentang_data"] = {
-                "mulai": format_date_id(dates.min()),
-                "sampai": format_date_id(dates.max()),
-                "jumlah_transaksi": int(len(df)),
-            }
-
-    fund_balance = summary.get("fund_balance", pd.DataFrame())
-    if isinstance(fund_balance, pd.DataFrame) and not fund_balance.empty:
-        payload["saldo_per_sumber_dana"] = [
-            {"sumber_dana": str(r["fund"]), "saldo": int(r["saldo"])}
-            for _, r in fund_balance.iterrows()
-        ]
-
-    if not budgets.empty:
-        budget_rows = budgets.copy()
-        budget_rows["amount"] = budget_rows["amount"].apply(clean_amount)
-        payload["budget_bulanan"] = [
-            {"orang": str(r["person"]), "komponen": str(r["component"]), "budget": int(r["amount"])}
-            for _, r in budget_rows.iterrows()
-        ]
-        payload["total_budget_bulanan"] = int(budget_rows["amount"].sum())
-
-    monthly_long, _pivot = monthly_category_summary(df)
-    if not monthly_long.empty:
-        payload["belanja_bulanan_per_kategori"] = [
-            {"bulan": str(r["Bulan"]), "kategori": str(r["Kategori"]), "nominal": int(r["Nominal"])}
-            for _, r in monthly_long.iterrows()
-        ]
-    category_out = summary.get("category_out", pd.DataFrame())
-    if isinstance(category_out, pd.DataFrame) and not category_out.empty:
-        payload["belanja_per_kategori_total"] = [
-            {"kategori": str(r["category"]), "nominal": int(r["keluar"])}
-            for _, r in category_out.iterrows()
-        ]
-
-    return payload
-
-
-def local_ai_fallback_answer(question: str, df: pd.DataFrame, budgets: pd.DataFrame) -> str:
-    """Fallback insight kalau OPENAI_API_KEY belum dipasang."""
-    summary = summarize(df)
-    lines = [
-        "Mode lokal aktif karena OPENAI_API_KEY belum dipasang. Ini ringkasan otomatis tanpa API:",
-        "",
-        f"- Total masuk: {full_rp(summary.get('total_in', 0))}",
-        f"- Total keluar: {full_rp(summary.get('total_out', 0))}",
-        f"- Sisa kas total: {full_rp(summary.get('saldo', 0))}",
-    ]
-    fb = summary.get("fund_balance", pd.DataFrame())
-    if isinstance(fb, pd.DataFrame) and not fb.empty:
-        lines.append("")
-        lines.append("Saldo per sumber dana:")
-        for _, row in fb.iterrows():
-            lines.append(f"- {row['fund']}: {full_rp(row['saldo'])}")
-
-    cat = summary.get("category_out", pd.DataFrame())
-    if isinstance(cat, pd.DataFrame) and not cat.empty:
-        lines.append("")
-        lines.append("Kategori belanja terbesar:")
-        for _, row in cat.head(5).iterrows():
-            lines.append(f"- {row['category']}: {full_rp(row['keluar'])}")
-
-    if not budgets.empty:
-        total_budget = int(budgets["amount"].sum())
-        saldo = int(summary.get("saldo", 0))
-        lines.append("")
-        lines.append(f"Total budget bulanan: {full_rp(total_budget)}")
-        if total_budget > 0:
-            lines.append(f"Estimasi kas bertahan sekitar {saldo / total_budget:.1f} bulan.")
-
-    lines.append("")
-    lines.append("Supaya bisa jawab pertanyaan bebas seperti chat AI, pasang OPENAI_API_KEY di Streamlit Secrets.")
-    return "\n".join(lines)
-
-
-def call_openai_ai_assistant(question: str, df: pd.DataFrame, budgets: pd.DataFrame) -> str:
-    api_key = get_openai_key()
-    if not api_key:
-        return local_ai_fallback_answer(question, df, budgets)
-
-    context_payload = ai_context_payload(df, budgets)
-    system_prompt = """
-Kamu adalah AI Assistant untuk aplikasi kas rumah dinas bernama Padebuolo Next.
-Tugasmu membaca ringkasan transaksi, budget, saldo, dan belanja bulanan yang diberikan dalam konteks JSON.
-Jawab dalam bahasa Indonesia yang santai, jelas, dan praktis seperti ngobrol dengan pemilik kas.
-Jangan mengarang data di luar konteks. Kalau data tidak cukup, bilang data belum cukup.
-Jangan memberi instruksi untuk mengubah database kecuali berupa saran. Kamu tidak punya izin melakukan update/delete transaksi.
-Prioritaskan jawaban dengan angka rupiah, ringkasan insight, dan langkah praktis.
-Format tanggal harus DD/MM/YYYY.
-""".strip()
-
-    user_payload = {
-        "pertanyaan_user": question,
-        "data_kas": context_payload,
-    }
-
-    try:
-        from openai import OpenAI
-
-        client = OpenAI(api_key=api_key)
-        response = client.responses.create(
-            model=get_openai_model(),
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False, default=str)},
-            ],
-            max_output_tokens=1200,
-        )
-        text = getattr(response, "output_text", None)
-        if text:
-            return str(text).strip()
-
-        # Fallback extraction for SDK variants.
-        chunks: List[str] = []
-        for item in getattr(response, "output", []) or []:
-            for content in getattr(item, "content", []) or []:
-                maybe_text = getattr(content, "text", None)
-                if maybe_text:
-                    chunks.append(str(maybe_text))
-        return "\n".join(chunks).strip() or "AI belum mengembalikan jawaban. Coba ulangi pertanyaannya."
-    except Exception as exc:
-        return (
-            "Gagal memanggil OpenAI API. Cek OPENAI_API_KEY, OPENAI_MODEL, billing, atau requirements.txt.\n\n"
-            f"Detail teknis: {type(exc).__name__}: {exc}"
+    if total_budget != expected_total:
+        st.warning(
+            "Budget saat ini belum sama dengan standar. "
+            f"Seharusnya total {format_budget_number(expected_total)}, saat ini {format_budget_number(total_budget)}."
         )
 
+    if st.button("Reset ke Budget Standar Padebuolo", type="primary", use_container_width=True):
+        reset_standard_budgets(mark_meta=True)
+        st.success("Budget berhasil direset: Rayhan 715,000 dan Azka 760,000.")
+        st.rerun()
 
-def page_ai_assistant(df: pd.DataFrame, budgets: pd.DataFrame) -> None:
-    st.title("🤖 AI Assistant")
-    logo_path = get_ai_logo_path()
-    c_logo, c_text = st.columns([0.22, 0.78])
-    with c_logo:
-        if logo_path:
-            st.image(str(logo_path), use_container_width=True)
+    with st.expander("Edit manual / tambah komponen lain"):
+        st.subheader("Daftar Budget Saat Ini")
+        if budgets.empty:
+            st.info("Belum ada budget.")
         else:
-            st.markdown("# 🤖")
-    with c_text:
-        st.markdown("### Asisten baca data kas Padebuolo")
-        st.caption("Mode aman: AI hanya membaca data dan memberi insight. AI tidak bisa edit, hapus, atau mengubah database.")
+            show = budgets.copy()
+            show["Orang"] = show["person"].map(PERSON_LABELS).fillna(show["person"])
+            show["Nominal"] = show["amount"].apply(format_budget_number)
+            display_df(show[["id", "Orang", "component", "Nominal"]].rename(columns={"component": "Komponen"}))
 
-    st.info("Versi ini sengaja tidak memakai komponen chat bawaan Streamlit (`st.chat_input`) supaya tidak kena error dynamic import `ChatInput...js` di Streamlit Cloud.")
+        st.subheader("Tambah Budget")
+        funds = get_fund_list(df)
+        with st.form("budget_form", clear_on_submit=True):
+            c1, c2, c3 = st.columns([1, 1.5, 1])
+            person = c1.selectbox("Sumber dana/orang", funds)
+            component = c2.text_input("Komponen", placeholder="Sewa, listrik, internet, air, dll")
+            amount = c3.number_input("Nominal", min_value=0, step=10_000, format="%d")
+            submitted = st.form_submit_button("Tambah Budget", type="primary")
+        if submitted:
+            if not component.strip() or amount <= 0:
+                st.error("Komponen dan nominal wajib diisi.")
+            else:
+                add_budget(person, component.strip(), int(amount))
+                st.success("Budget ditambahkan.")
+                st.rerun()
 
-    api_key = get_openai_key()
-    if not api_key:
-        st.warning("OPENAI_API_KEY belum dipasang. AI Assistant akan jalan dalam mode ringkasan lokal. Untuk chat AI penuh, isi OPENAI_API_KEY di Streamlit Secrets.")
-    else:
-        st.success(f"OpenAI API aktif. Model: {get_openai_model()}")
+        if not budgets.empty:
+            st.subheader("Hapus Budget")
+            selected = st.selectbox("Pilih budget", budgets["id"].astype(int).tolist(), format_func=lambda x: f"ID {x}")
+            if st.button("Hapus Budget Terpilih"):
+                delete_budget(int(selected))
+                st.warning("Budget dihapus.")
+                st.rerun()
 
-    with st.expander("Contoh pertanyaan", expanded=False):
-        examples = [
-            "Ringkas kondisi kas rumah dinas sekarang.",
-            "Bulan apa pengeluaran paling besar dan kategori apa penyebabnya?",
-            "Sisa kas Azka dan Rayhan masing-masing aman nggak?",
-            "Kategori belanja mana yang paling boros dan saran hematnya apa?",
-            "Bandingkan realisasi belanja dengan budget bulanan.",
-            "Transaksi yang masih Lainnya sebaiknya dikategorikan apa?",
-        ]
-        st.write("\n".join([f"- {x}" for x in examples]))
 
-    if "ai_messages" not in st.session_state:
-        st.session_state.ai_messages = []
-    if "ai_question_box" not in st.session_state:
-        st.session_state.ai_question_box = ""
-
-    quick_cols = st.columns(4)
-    quick_prompts = [
-        ("Ringkasan kas", "Ringkas kondisi kas rumah dinas sekarang, termasuk total masuk, total keluar, sisa kas per orang, dan hal yang perlu diperhatikan."),
-        ("Kategori boros", "Kategori belanja mana yang paling besar? Jelaskan penyebab yang terlihat dari data dan beri saran hemat."),
-        ("Budget check", "Bandingkan saldo dan belanja dengan budget bulanan Rayhan dan Azka. Kas masih aman berapa bulan?"),
-        ("Cek Lainnya", "Cek transaksi kategori Lainnya. Beri saran keyword/kategori yang bisa dipakai untuk kategorisasi massal."),
-    ]
-    for col, (label, prompt) in zip(quick_cols, quick_prompts):
-        if col.button(label, use_container_width=True):
-            st.session_state.ai_question_box = prompt
-            st.rerun()
+def page_import_export(df: pd.DataFrame, budgets: pd.DataFrame) -> None:
+    st.title("📦 Import / Export")
+    st.subheader("Export")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.download_button("Backup JSON", data=backup_json_bytes(), file_name="backup_kas_rumdin.json", mime="application/json", use_container_width=True)
+    c2.download_button("Buku Besar CSV", data=to_csv_bytes(detail_ledger_view(df)), file_name="buku_besar_kas_rumdin.csv", mime="text/csv", use_container_width=True)
+    c3.download_button("Export Excel", data=export_excel_bytes(), file_name="rekap_kas_rumdin.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+    if DB_PATH.exists():
+        c4.download_button("Download DB", data=DB_PATH.read_bytes(), file_name="kas_rumdin.db", mime="application/octet-stream", use_container_width=True)
 
     st.divider()
-
-    with st.form("ai_assistant_form", clear_on_submit=False):
-        question = st.text_area(
-            "Tanya AI soal kas rumah dinas",
-            key="ai_question_box",
-            height=120,
-            placeholder="Contoh: Bulan April pengeluaran paling besar kategori apa?",
-        )
-        submitted = st.form_submit_button("Tanya AI", use_container_width=True)
-
-    if submitted:
-        question_clean = str(question or "").strip()
-        if not question_clean:
-            st.warning("Isi pertanyaannya dulu, pak.")
-        else:
-            st.session_state.ai_messages.append({"role": "user", "content": question_clean})
-            with st.spinner("AI lagi baca data kas..."):
-                answer = call_openai_ai_assistant(question_clean, df, budgets)
-            st.session_state.ai_messages.append({"role": "assistant", "content": answer})
-            st.rerun()
-
-    if st.session_state.ai_messages:
-        st.markdown("### Riwayat tanya jawab")
-        for i, msg in enumerate(st.session_state.ai_messages, start=1):
-            if msg.get("role") == "user":
-                st.markdown(f"**🧑 Pertanyaan {i}:**")
-                st.markdown(f"> {msg.get('content', '')}")
+    st.subheader("Import")
+    st.caption("Bisa import backup JSON dari app ini, CSV transaksi, atau Excel lama dengan sheet Master Kas/Biaya Bulanan.")
+    uploaded = st.file_uploader("Upload file", type=["json", "csv", "xlsx", "xls"])
+    replace = st.toggle("Replace semua data saat import", value=False, help="Kalau aktif, transaksi dan budget lama akan dihapus dulu.")
+    if uploaded is not None:
+        tx_rows: List[Dict[str, Any]] = []
+        budget_rows: List[Dict[str, Any]] = []
+        try:
+            if uploaded.name.lower().endswith(".json"):
+                payload = json.loads(uploaded.getvalue().decode("utf-8"))
+                tx_rows = payload.get("transactions", [])
+                budget_rows = payload.get("budgets", [])
+            elif uploaded.name.lower().endswith(".csv"):
+                imported_df = pd.read_csv(uploaded)
+                tx_rows = normalize_transactions_from_df(imported_df)
             else:
-                st.markdown("**🤖 Jawaban AI:**")
-                st.markdown(msg.get("content", ""))
-                st.divider()
-    else:
-        st.caption("Belum ada riwayat. Pilih tombol cepat atau tulis pertanyaan manual.")
+                xl = pd.ExcelFile(uploaded)
+                tx_sheet = None
+                budget_sheet = None
+                for sheet in xl.sheet_names:
+                    low = sheet.lower()
+                    if tx_sheet is None and ("trans" in low or "master" in low or "buku" in low):
+                        tx_sheet = sheet
+                    if budget_sheet is None and ("budget" in low or "biaya" in low):
+                        budget_sheet = sheet
+                if tx_sheet:
+                    tx_rows = normalize_transactions_from_df(pd.read_excel(xl, sheet_name=tx_sheet))
+                if budget_sheet:
+                    budget_rows = normalize_budgets_from_df(pd.read_excel(xl, sheet_name=budget_sheet))
+            st.info(f"Terdeteksi {len(tx_rows)} transaksi dan {len(budget_rows)} budget.")
+            with st.expander("Preview transaksi import"):
+                display_df(pd.DataFrame(tx_rows).head(20))
+            if st.button("Proses Import", type="primary"):
+                tx_count, bd_count = import_rows(tx_rows, budget_rows, replace=replace)
+                st.success(f"Import selesai: {tx_count} transaksi dan {bd_count} budget masuk.")
+                st.rerun()
+        except Exception as exc:
+            st.error(f"Gagal membaca file: {exc}")
 
-    c1, c2 = st.columns(2)
-    if c1.button("Hapus riwayat AI", use_container_width=True):
-        st.session_state.ai_messages = []
-        st.rerun()
-    c2.download_button(
-        "Download konteks data untuk AI",
-        data=json.dumps(ai_context_payload(df, budgets), ensure_ascii=False, indent=2, default=str).encode("utf-8"),
-        file_name="padebuolo_ai_context.json",
-        mime="application/json",
-        use_container_width=True,
-    )
+    st.divider()
+    st.subheader("Reset Data dari File GitHub")
+    st.warning("Reset akan menghapus semua transaksi dan budget aktif, lalu mengisi ulang dari data/seed_transactions.csv dan data/seed_budgets.csv di GitHub.")
+    confirm = st.text_input("Ketik RESET untuk konfirmasi")
+    if st.button("Reset ke Data Import Ready"):
+        if confirm == "RESET":
+            try:
+                tx_count, bd_count = reset_db_from_seed_files()
+                st.success(f"Data berhasil direset: {tx_count} transaksi dan {bd_count} budget masuk.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Reset gagal: {exc}")
+        else:
+            st.error("Konfirmasi belum sesuai.")
+
+
 
 def page_bulk_category(df: pd.DataFrame) -> None:
     st.title("🧠 Kategorisasi Massal")
@@ -1883,14 +2002,70 @@ def page_settings(df: pd.DataFrame) -> None:
                 st.success(f"Berhasil memperbaiki {changed} tanggal.")
                 st.rerun()
 
-    st.subheader("Catatan Penyimpanan")
-    st.markdown(
-        """
-        - App ini pakai **SQLite** sebagai database backend.
-        - Kalau jalan lokal/VPS/PythonAnywhere, data tersimpan di file `.db`.
-        - Kalau deploy ke Streamlit Community Cloud, database lokal bisa cocok untuk demo, tapi untuk pemakaian jangka panjang tetap biasakan **Backup JSON/Excel** atau naik kelas ke Supabase/PostgreSQL.
-        """
-    )
+    st.divider()
+    st.subheader("Upload Ulang Data dari File GitHub")
+    st.caption("Pakai ini setelah lo replace file data/seed_transactions.csv dan data/seed_budgets.csv di GitHub. Ini akan mengganti database aktif dengan file import-ready tersebut.")
+    seed_tx = DATA_DIR / "seed_transactions.csv"
+    seed_bd = DATA_DIR / "seed_budgets.csv"
+    st.write("File seed transaksi:")
+    st.code(str(seed_tx))
+    st.write("File seed budget:")
+    st.code(str(seed_bd))
+    confirm_seed_reset = st.checkbox("Saya paham: database aktif akan diganti total dari file seed GitHub", key="confirm_seed_reset_v57")
+    if st.button("Reset Database dari File Seed GitHub", type="primary", disabled=not confirm_seed_reset):
+        try:
+            tx_count, bd_count = reset_db_from_seed_files()
+            st.success(f"Berhasil reset dari seed: {tx_count} transaksi dan {bd_count} budget.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Reset dari seed gagal: {exc}")
+
+    st.divider()
+    st.subheader("Penyimpanan Permanen")
+    if cloud_sync_enabled():
+        cfg = cloud_sync_config()
+        st.success("Cloud backup aktif. Setiap perubahan akan disimpan ke GitHub JSON backup.")
+        st.write("Lokasi backup cloud:")
+        st.code(f"{cfg['repo']} / {cfg['branch']} / {cfg['path']}")
+        if st.session_state.get("cloud_sync_last_status"):
+            st.info(st.session_state.get("cloud_sync_last_status"))
+        if st.session_state.get("cloud_sync_last_error"):
+            st.warning(st.session_state.get("cloud_sync_last_error"))
+        c1, c2 = st.columns(2)
+        if c1.button("Simpan backup cloud sekarang", use_container_width=True):
+            ok = sync_local_db_to_github(reason="manual_backup")
+            if ok:
+                st.success("Backup cloud berhasil disimpan.")
+            else:
+                st.error(st.session_state.get("cloud_sync_last_error", "Backup cloud gagal."))
+        if c2.button("Pulihkan dari backup cloud", use_container_width=True):
+            snapshot = load_snapshot_from_github()
+            if snapshot:
+                tx_count, bd_count = replace_local_db_from_snapshot(snapshot)
+                st.success(f"Berhasil pulihkan {tx_count} transaksi dan {bd_count} budget dari cloud.")
+                st.rerun()
+            else:
+                st.warning("Backup cloud belum ditemukan.")
+    else:
+        st.warning("Cloud backup belum aktif. Kalau Streamlit reboot/idle, perubahan di SQLite lokal bisa hilang.")
+        st.markdown(
+            """
+            Isi **Streamlit Secrets** seperti ini agar data tetap aman setelah reboot:
+
+            ```toml
+            APP_PASSWORD = "password-app-lo"
+            PERSISTENCE_PROVIDER = "github"
+            GITHUB_TOKEN = "github_pat_xxx"
+            GITHUB_REPO = "username/padebuolo-data"
+            GITHUB_BRANCH = "main"
+            GITHUB_DATA_FILE = "padebuolo_live_backup.json"
+            ```
+
+            Saran: pakai repo data terpisah/private, misalnya `padebuolo-data`, supaya backup data tidak memicu redeploy app.
+            """
+        )
+
+    st.caption("SQLite tetap dipakai sebagai database kerja cepat di runtime. GitHub JSON backup dipakai untuk restore otomatis saat local DB kosong setelah reboot.")
 
 
 def main() -> None:
@@ -1904,7 +2079,7 @@ def main() -> None:
     st.sidebar.title("🏠 V.4 Padebuolo Next")
     page = st.sidebar.radio(
         "Menu",
-        ["Dashboard", "Input Transaksi", "Buku Besar", "Pergerakan Belanja", "🤖 AI Assistant", "Kategorisasi Massal", "Budget Bulanan", "Import / Export", "Pengaturan"],
+        ["Dashboard", "Input Transaksi", "Buku Besar", "Pergerakan Belanja", "Kategorisasi Massal", "Budget Bulanan", "Import / Export", "Pengaturan"],
     )
     st.sidebar.divider()
     st.sidebar.caption(f"{APP_VERSION}")
@@ -1920,8 +2095,6 @@ def main() -> None:
         page_ledger(df)
     elif page == "Pergerakan Belanja":
         page_monthly_category(df)
-    elif page == "🤖 AI Assistant":
-        page_ai_assistant(df, budgets)
     elif page == "Kategorisasi Massal":
         page_bulk_category(df)
     elif page == "Budget Bulanan":
