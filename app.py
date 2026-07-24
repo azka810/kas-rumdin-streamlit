@@ -1,2108 +1,1598 @@
-# FINAL FILE - V5.1 BUDGET PADEBUOLO FIX - DD/MM/YYYY + PERGERAKAN BELANJA
-from __future__ import annotations
 
+import base64
 import io
 import json
 import os
-import re
 import sqlite3
+import time
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
 
 import pandas as pd
-import streamlit as st
 import requests
+import streamlit as st
 
-APP_TITLE = "V.4 Padebuolo Next"
-APP_VERSION = "V.5.7 Padebuolo Next - No AI + Import Ready + Persistent Backup"
-DEFAULT_PASSWORD = "rumdin123"
+APP_TITLE = "V.6 Padebuolo Fresh"
+APP_VERSION = "V.6.4 Fresh - Beyond ssssuuuuper!!!!"
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
-INSTANCE_DIR = Path(os.getenv("DATA_DIR", BASE_DIR / "instance"))
-INSTANCE_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = Path(os.getenv("DB_PATH", INSTANCE_DIR / "kas_rumdin.db"))
+INSTANCE_DIR = BASE_DIR / "instance"
+INSTANCE_DIR.mkdir(exist_ok=True)
+DB_PATH = INSTANCE_DIR / "padebuolo.db"
+
+SEED_TX_PATH = DATA_DIR / "seed_transactions.csv"
+SEED_BUDGET_PATH = DATA_DIR / "seed_budgets.csv"
+SEED_XLSX_PATH = DATA_DIR / "Rekap Kas Rumdin.xlsx"
 
 CATEGORIES = [
     "Saldo Awal",
     "Inject Dana / Top Up",
-    "Iuran Bulanan",
-    "Sewa",
     "Internet",
+    "Laundry",
     "Listrik",
     "Air / PDAM",
-    "Laundry",
+    "Sewa",
     "Perlengkapan Rumah",
     "Pemeliharaan",
     "Renovasi",
     "Aset Rumah",
-    "Kebersihan",
+    "Konsumsi",
+    "Transport / Parkir",
+    "Iuran / Patungan",
+    "Reimbursement",
     "Lainnya",
 ]
-METHODS = ["Kas", "Transfer", "QRIS", "Lainnya"]
-DEFAULT_FUNDS = ["Kas Rayhan", "Kas Azka"]
 
-DEFAULT_BUDGETS = [
-    ("Kas Rayhan", "Sewa", 200_000),
-    ("Kas Rayhan", "Indihome", 165_000),
-    ("Kas Rayhan", "Listrik", 300_000),
-    ("Kas Rayhan", "Air", 50_000),
-    ("Kas Azka", "Sewa", 245_000),
-    ("Kas Azka", "Indihome", 165_000),
-    ("Kas Azka", "Listrik", 300_000),
-    ("Kas Azka", "Air", 50_000),
+FUNDS_DEFAULT = ["Kas Azka", "Kas Rayhan"]
+METHODS = ["Kas", "Transfer", "QRIS", "Tunai", "Lainnya"]
+
+BUDGET_STANDARD = [
+    {"fund": "Kas Rayhan", "component": "Sewa", "amount": 200000, "note": ""},
+    {"fund": "Kas Rayhan", "component": "Indihome", "amount": 165000, "note": ""},
+    {"fund": "Kas Rayhan", "component": "Listrik", "amount": 300000, "note": ""},
+    {"fund": "Kas Rayhan", "component": "Air", "amount": 50000, "note": ""},
+    {"fund": "Kas Azka", "component": "Sewa", "amount": 245000, "note": ""},
+    {"fund": "Kas Azka", "component": "Indihome", "amount": 165000, "note": ""},
+    {"fund": "Kas Azka", "component": "Listrik", "amount": 300000, "note": ""},
+    {"fund": "Kas Azka", "component": "Air", "amount": 50000, "note": ""},
 ]
 
-PERSON_LABELS = {
-    "Kas Rayhan": "Rayhan",
-    "Kas Azka": "Azka",
+KEYWORD_RULES = {
+    "Internet": ["wifi", "indihome", "internet"],
+    "Laundry": ["laundry", "cuci karpet", "cuci"],
+    "Listrik": ["listrik", "pln", "token"],
+    "Air / PDAM": ["pdam", "air", "galon"],
+    "Sewa": ["sewa", "rumdin"],
+    "Perlengkapan Rumah": ["lampu", "kran", "pipa", "lem", "perlengkapan", "sapu", "pel"],
+    "Pemeliharaan": ["rumput", "pemeliharaan", "obat rumput", "bensin mesin"],
+    "Renovasi": ["cat", "roller", "amplas", "kunci jendela"],
+    "Aset Rumah": ["kulkas", "ongkir kulkas", "double tip"],
+    "Inject Dana / Top Up": ["inject", "top up", "tambah dana", "setor"],
+    "Saldo Awal": ["saldo awal"],
 }
 
-BUDGET_COMPONENT_ORDER = {
-    "Sewa": 1,
-    "Indihome": 2,
-    "Listrik": 3,
-    "Air": 4,
-}
 
-ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
-DMY_SLASH_RE = re.compile(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$")
-MONTH_NAMES_ID = {
-    1: "Januari",
-    2: "Februari",
-    3: "Maret",
-    4: "April",
-    5: "Mei",
-    6: "Juni",
-    7: "Juli",
-    8: "Agustus",
-    9: "September",
-    10: "Oktober",
-    11: "November",
-    12: "Desember",
-}
-MONTH_NAMES_ID_LOOKUP = {name.lower(): num for num, name in MONTH_NAMES_ID.items()}
-MONTH_NAMES_ID_LOOKUP.update({
-    "jan": 1,
-    "feb": 2,
-    "mar": 3,
-    "apr": 4,
-    "mei": 5,
-    "may": 5,
-    "jun": 6,
-    "jul": 7,
-    "agu": 8,
-    "ags": 8,
-    "aug": 8,
-    "sep": 9,
-    "okt": 10,
-    "oct": 10,
-    "nov": 11,
-    "des": 12,
-    "dec": 12,
-})
-
-
-def parse_any_date(value: Any) -> pd.Timestamp:
-    """Parse dates consistently using Indonesian/DD-MM-YYYY assumptions.
-
-    Database dates are stored as ISO YYYY-MM-DD for sorting. User-facing dates may
-    come from Excel/CSV as DD/MM/YYYY, DD-MM-YYYY, Excel serial numbers, or
-    Indonesian month names such as "10 April 2026". This function keeps those
-    cases from being flipped into US month/day order.
-    """
-    if value is None:
-        return pd.NaT
-    if isinstance(value, pd.Timestamp):
-        return pd.Timestamp(value.date()) if not pd.isna(value) else pd.NaT
-    if isinstance(value, datetime):
-        return pd.Timestamp(value.date())
-    if isinstance(value, date):
-        return pd.Timestamp(value)
+# ----------------------
+# Helpers
+# ----------------------
+def get_secret(name, default=None):
     try:
-        if pd.isna(value):
-            return pd.NaT
+        return st.secrets.get(name, os.environ.get(name, default))
     except Exception:
-        pass
+        return os.environ.get(name, default)
 
-    # Excel often stores dates as serial numbers. Keep this before string parsing.
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
+
+def parse_number(value, default=0):
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if text == "":
+        return default
+    text = text.replace("Rp", "").replace("rp", "").replace(" ", "")
+    if "," in text and "." in text:
+        # Indonesian-style 1.234.567,89
+        text = text.replace(".", "").replace(",", ".")
+    elif "," in text and "." not in text:
+        # Could be 123,000 or 123,45. For this app, comma is usually thousands.
+        text = text.replace(",", "")
+    else:
+        text = text.replace(",", "")
+    try:
+        return float(text)
+    except Exception:
+        return default
+
+
+def parse_date_any(value):
+    if value is None or str(value).strip() == "":
+        return date.today().isoformat()
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, (int, float)) and not pd.isna(value):
+        # Excel serial date
         try:
-            num = float(value)
-            if 20_000 <= num <= 80_000:
-                return pd.to_datetime(num, unit="D", origin="1899-12-30", errors="coerce")
+            dt = pd.Timestamp("1899-12-30") + pd.to_timedelta(int(value), unit="D")
+            return dt.date().isoformat()
         except Exception:
             pass
 
     text = str(value).strip()
-    if not text or text.lower() in {"nan", "none", "nat", "-"}:
-        return pd.NaT
-
-    # Drop time suffix if the value is like "2026-04-10 00:00:00".
-    text_date_only = text.split()[0] if ISO_DATE_RE.match(text) else text
-
-    # Internal DB / ISO format: YYYY-MM-DD must never be parsed day-first.
-    if ISO_DATE_RE.match(text_date_only):
-        return pd.to_datetime(text_date_only[:10], format="%Y-%m-%d", errors="coerce")
-
-    # Indonesian numeric format: DD/MM/YYYY or DD-MM-YYYY.
-    m = DMY_SLASH_RE.match(text_date_only)
-    if m:
-        d, mth, y = map(int, m.groups())
-        try:
-            return pd.Timestamp(year=y, month=mth, day=d)
-        except Exception:
-            return pd.NaT
-
-    # Indonesian month-name format: 10 April 2026 / 10 Apr 2026.
-    m = re.match(r"^(\d{1,2})\s+([A-Za-zÀ-ÿ]+)\s+(\d{4})$", text, flags=re.IGNORECASE)
-    if m:
-        d = int(m.group(1))
-        month_text = m.group(2).lower()
-        y = int(m.group(3))
-        month_num = MONTH_NAMES_ID_LOOKUP.get(month_text)
-        if month_num:
-            try:
-                return pd.Timestamp(year=y, month=month_num, day=d)
-            except Exception:
-                return pd.NaT
-
-    # Last fallback still assumes Indonesian/DD-first order.
-    return pd.to_datetime(text, dayfirst=True, errors="coerce")
-
-
-def format_date_short_id(value: Any) -> str:
-    parsed = parse_any_date(value)
-    if pd.isna(parsed):
-        return ""
-    return parsed.strftime("%d/%m/%Y")
-
-
-def format_date_id(value: Any) -> str:
-    """Display date in DD/MM/YYYY format, e.g. 10/04/2026."""
-    parsed = parse_any_date(value)
-    if pd.isna(parsed):
-        return ""
-    return parsed.strftime("%d/%m/%Y")
-
-
-def month_key_from_date(value: Any) -> str:
-    parsed = parse_any_date(value)
-    if pd.isna(parsed):
-        return ""
-    return parsed.strftime("%Y-%m")
-
-
-def format_month_key_id(month_key: Any) -> str:
-    text = str(month_key).strip()
-    parsed = pd.to_datetime(f"{text}-01", format="%Y-%m-%d", errors="coerce")
-    if pd.isna(parsed):
-        return text
-    return f"{MONTH_NAMES_ID[int(parsed.month)]} {int(parsed.year)}"
-
-
-def date_input_id(container: Any, label: str, value: date, **kwargs: Any) -> date:
-    """Streamlit date input with Indonesian numeric display when supported."""
-    label = f"{label} (DD/MM/YYYY)"
+    # ISO must remain year-month-day
     try:
-        return container.date_input(label, value=value, format="DD/MM/YYYY", **kwargs)
-    except TypeError:
-        return container.date_input(label, value=value, **kwargs)
-
-CATEGORY_RULES = {
-    "Saldo Awal": ["saldo awal", "opening balance", "awal kas"],
-    "Inject Dana / Top Up": ["inject", "top up", "topup", "tambah dana", "tambahan dana", "isi kas", "isi saldo", "setor", "setoran"],
-    "Iuran Bulanan": ["iuran", "kas bulanan", "bulanan", "patungan kas"],
-    "Sewa": ["sewa", "kontrakan", "rent", "kos", "kost"],
-    "Internet": ["wifi", "wi-fi", "internet", "indihome", "biznet", "first media", "router", "modem"],
-    "Listrik": ["listrik", "pln", "token", "pulsa listrik", "kwh"],
-    "Air / PDAM": ["pdam", "air", "galon", "aqua", "le minerale", "isi ulang"],
-    "Laundry": ["laundry", "cuci", "setrika"],
-    "Perlengkapan Rumah": ["lampu", "sapu", "pel", "ember", "keset", "sabun", "tisu", "tisue", "detergen", "deterjen", "piring", "gelas", "sendok", "garpu", "wajan", "panci", "kabel", "terminal", "stop kontak", "sprei", "bantal", "guling", "hanger", "gantungan"],
-    "Pemeliharaan": ["service", "servis", "perbaikan", "benerin", "betulin", "maintenance", "tukang", "tambal", "ganti", "instalasi", "pasang"],
-    "Renovasi": ["renov", "renovasi", "cat", "semen", "paku", "bor", "triplek", "keramik"],
-    "Aset Rumah": ["kipas", "dispenser", "kompor", "kasur", "lemari", "rak", "meja", "kursi", "magic com", "rice cooker", "ac", "kulkas"],
-    "Kebersihan": ["kebersihan", "sampah", "cleaning", "karbol", "wipol", "sikat", "lap", "kanebo", "baygon", "obat nyamuk"],
-}
-
-st.set_page_config(
-    page_title=APP_TITLE,
-    page_icon="🏠",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-CUSTOM_CSS = """
-<style>
-    .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
-    div[data-testid="stMetric"] {
-        background: rgba(250, 250, 250, 0.85);
-        border: 1px solid rgba(49, 51, 63, 0.12);
-        border-radius: 16px;
-        padding: 14px 16px;
-        box-shadow: 0 1px 2px rgba(0,0,0,0.03);
-    }
-    .small-note {
-        color: rgba(49, 51, 63, 0.68);
-        font-size: 0.92rem;
-        line-height: 1.45;
-    }
-    .pill {
-        display: inline-block;
-        padding: 0.25rem 0.55rem;
-        border-radius: 999px;
-        background: rgba(49, 51, 63, 0.08);
-        margin-right: 0.25rem;
-        margin-bottom: 0.25rem;
-        font-size: 0.86rem;
-    }
-</style>
-"""
-st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
-
-
-def get_config_value(key: str, default: str = "") -> str:
-    """Read config from Streamlit secrets first, then environment, then default."""
-    try:
-        value = st.secrets.get(key, None)  # type: ignore[attr-defined]
-        if value is not None:
-            return str(value)
+        if len(text) >= 10 and text[4] in ["-", "/"] and text[:4].isdigit():
+            return pd.to_datetime(text[:10], yearfirst=True, errors="raise").date().isoformat()
     except Exception:
         pass
-    return os.getenv(key, default)
 
+    # Indonesian format must be day/month/year
+    for fmt in ["%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y", "%d-%m-%y"]:
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except Exception:
+            pass
 
-_REMOTE_RESTORE_IN_PROGRESS = False
-
-
-def cloud_sync_config() -> Dict[str, str]:
-    """GitHub JSON persistence config from Streamlit Secrets/env."""
-    return {
-        "provider": get_config_value("PERSISTENCE_PROVIDER", "").strip().lower(),
-        "token": get_config_value("GITHUB_TOKEN", "").strip(),
-        "repo": get_config_value("GITHUB_REPO", "").strip(),
-        "branch": get_config_value("GITHUB_BRANCH", "main").strip() or "main",
-        "path": get_config_value("GITHUB_DATA_FILE", "data/padebuolo_live_backup.json").strip() or "data/padebuolo_live_backup.json",
-    }
-
-
-def cloud_sync_enabled() -> bool:
-    cfg = cloud_sync_config()
-    provider_ok = cfg["provider"] in {"github", "git", "gh"}
-    return bool(provider_ok and cfg["token"] and cfg["repo"] and cfg["path"])
-
-
-def set_sync_status(message: str | None = None, error: str | None = None) -> None:
-    if message:
-        st.session_state["cloud_sync_last_status"] = message
-    if error:
-        st.session_state["cloud_sync_last_error"] = error
-    elif message:
-        st.session_state.pop("cloud_sync_last_error", None)
-
-
-def github_api_request(method: str, url: str, **kwargs: Any) -> requests.Response:
-    cfg = cloud_sync_config()
-    headers = kwargs.pop("headers", {}) or {}
-    headers.update({
-        "Authorization": f"Bearer {cfg['token']}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    })
-    return requests.request(method, url, headers=headers, timeout=20, **kwargs)
-
-
-def snapshot_from_local_db() -> Dict[str, Any]:
-    tx = fetch_transactions().drop(columns=["netto", "running_balance"], errors="ignore").to_dict(orient="records")
-    budgets = fetch_budgets().to_dict(orient="records")
-    return {
-        "exported_at": datetime.utcnow().isoformat(timespec="seconds"),
-        "app": APP_TITLE,
-        "app_version": APP_VERSION,
-        "transactions": tx,
-        "budgets": budgets,
-    }
-
-
-def replace_local_db_from_snapshot(snapshot: Dict[str, Any]) -> Tuple[int, int]:
-    global _REMOTE_RESTORE_IN_PROGRESS
-    _REMOTE_RESTORE_IN_PROGRESS = True
+    # Fallback dayfirst
     try:
-        transactions = snapshot.get("transactions", []) or []
-        budgets = snapshot.get("budgets", []) or []
-        conn = get_conn()
-        now = datetime.utcnow().isoformat(timespec="seconds")
-        with conn:
-            conn.execute("DELETE FROM transactions")
-            conn.execute("DELETE FROM budgets")
-            for tx in transactions:
-                amount = clean_amount(tx.get("amount"))
-                if amount <= 0:
-                    continue
-                conn.execute(
-                    """
-                    INSERT INTO transactions(date, fund, type, amount, category, description, method, note, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        parse_date(tx.get("date")),
-                        str(tx.get("fund", DEFAULT_FUNDS[0])).strip() or DEFAULT_FUNDS[0],
-                        "Masuk" if str(tx.get("type", "Keluar")).lower() == "masuk" else "Keluar",
-                        amount,
-                        str(tx.get("category", "Lainnya")).strip() or "Lainnya",
-                        str(tx.get("description", "Transaksi")).strip() or "Transaksi",
-                        str(tx.get("method", "Kas")).strip() or "Kas",
-                        "" if pd.isna(tx.get("note", "")) else str(tx.get("note", "")).strip(),
-                        now,
-                        now,
-                    ),
-                )
-            for bd in budgets:
-                amount = clean_amount(bd.get("amount"))
-                if amount <= 0:
-                    continue
-                conn.execute(
-                    "INSERT INTO budgets(person, component, amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                    (
-                        str(bd.get("person", DEFAULT_FUNDS[0])).strip() or DEFAULT_FUNDS[0],
-                        str(bd.get("component", "Kebutuhan")).strip() or "Kebutuhan",
-                        amount,
-                        now,
-                        now,
-                    ),
-                )
-            conn.execute("INSERT OR REPLACE INTO app_meta(key, value) VALUES('restored_from_cloud_at', ?)", (now,))
-        return len(transactions), len(budgets)
-    finally:
-        _REMOTE_RESTORE_IN_PROGRESS = False
-
-
-def load_snapshot_from_github() -> Dict[str, Any] | None:
-    if not cloud_sync_enabled():
-        return None
-    try:
-        import base64
-        cfg = cloud_sync_config()
-        url = f"https://api.github.com/repos/{cfg['repo']}/contents/{cfg['path']}"
-        resp = github_api_request("GET", url, params={"ref": cfg["branch"]})
-        if resp.status_code == 404:
-            return None
-        if resp.status_code != 200:
-            raise RuntimeError(f"GitHub GET {resp.status_code}: {resp.text[:300]}")
-        payload = resp.json()
-        raw = base64.b64decode(payload.get("content", "")).decode("utf-8")
-        return json.loads(raw)
-    except Exception as exc:
-        set_sync_status(error=f"Restore cloud gagal: {exc}")
-        return None
-
-
-def restore_from_github_if_local_empty() -> bool:
-    if not cloud_sync_enabled():
-        return False
-    try:
-        conn = get_conn()
-        count = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
-        if count > 0:
-            return False
-        snapshot = load_snapshot_from_github()
-        if not snapshot:
-            return False
-        tx_count, bd_count = replace_local_db_from_snapshot(snapshot)
-        set_sync_status(f"Restore cloud berhasil: {tx_count} transaksi, {bd_count} budget.")
-        return True
-    except Exception as exc:
-        set_sync_status(error=f"Restore cloud gagal: {exc}")
-        return False
-
-
-def sync_local_db_to_github(reason: str = "update") -> bool:
-    if _REMOTE_RESTORE_IN_PROGRESS or not cloud_sync_enabled():
-        return False
-    try:
-        import base64
-        cfg = cloud_sync_config()
-        url = f"https://api.github.com/repos/{cfg['repo']}/contents/{cfg['path']}"
-        sha = None
-        get_resp = github_api_request("GET", url, params={"ref": cfg["branch"]})
-        if get_resp.status_code == 200:
-            sha = get_resp.json().get("sha")
-        elif get_resp.status_code != 404:
-            raise RuntimeError(f"GitHub GET {get_resp.status_code}: {get_resp.text[:300]}")
-
-        snapshot = snapshot_from_local_db()
-        raw = json.dumps(snapshot, ensure_ascii=False, indent=2, default=str).encode("utf-8")
-        body = {
-            "message": f"Update Padebuolo live data ({reason})",
-            "content": base64.b64encode(raw).decode("ascii"),
-            "branch": cfg["branch"],
-        }
-        if sha:
-            body["sha"] = sha
-        put_resp = github_api_request("PUT", url, json=body)
-        if put_resp.status_code not in (200, 201):
-            raise RuntimeError(f"GitHub PUT {put_resp.status_code}: {put_resp.text[:300]}")
-        set_sync_status(f"Backup cloud tersimpan: {snapshot['exported_at']} UTC")
-        return True
-    except Exception as exc:
-        set_sync_status(error=f"Backup cloud gagal: {exc}")
-        return False
-
-
-def sync_after_write(reason: str = "update") -> None:
-    if cloud_sync_enabled():
-        sync_local_db_to_github(reason=reason)
-
-
-def compact_rp(value: Any) -> str:
-    try:
-        n = float(value or 0)
+        return pd.to_datetime(text, dayfirst=True, errors="raise").date().isoformat()
     except Exception:
-        n = 0.0
-    sign = "-" if n < 0 else ""
-    n = abs(n)
-    if n >= 1_000_000_000:
-        return f"{sign}Rp{n/1_000_000_000:.2f} M".replace(".00", "")
-    if n >= 1_000_000:
-        return f"{sign}Rp{n/1_000_000:.2f} jt".replace(".00", "")
-    if n >= 1_000:
-        return f"{sign}Rp{n/1_000:.1f} rb".replace(".0", "")
-    return f"{sign}Rp{n:,.0f}".replace(",", ".")
-
-
-def full_rp(value: Any) -> str:
-    try:
-        n = int(round(float(value or 0)))
-    except Exception:
-        n = 0
-    return f"Rp{n:,}".replace(",", ".")
-
-
-def clean_amount(value: Any) -> int:
-    if value is None:
-        return 0
-    if isinstance(value, (int, float)) and not pd.isna(value):
-        return max(0, int(round(value)))
-    text = str(value).strip()
-    if not text or text.lower() in {"nan", "none", "-"}:
-        return 0
-    digits = "".join(ch for ch in text if ch.isdigit() or ch == "-")
-    try:
-        return max(0, int(digits or 0))
-    except Exception:
-        return 0
-
-
-
-def normalize_text(value: Any) -> str:
-    if value is None or pd.isna(value):
-        return ""
-    return str(value).lower().strip()
-
-
-def infer_category(description: Any, note: Any = "", tx_type: str = "Keluar") -> str:
-    """Infer a transaction category from description/note keywords."""
-    combined = f"{normalize_text(description)} {normalize_text(note)}"
-    if tx_type == "Masuk":
-        for category in ["Saldo Awal", "Inject Dana / Top Up", "Iuran Bulanan"]:
-            if any(keyword in combined for keyword in CATEGORY_RULES.get(category, [])):
-                return category
-        return "Iuran Bulanan"
-    for category, keywords in CATEGORY_RULES.items():
-        if category in {"Saldo Awal", "Inject Dana / Top Up", "Iuran Bulanan"}:
-            continue
-        if any(keyword in combined for keyword in keywords):
-            return category
-    return "Lainnya"
-
-
-def recategorize_by_rules(only_lainnya: bool = True) -> int:
-    df = fetch_transactions()
-    if df.empty:
-        return 0
-    now = datetime.utcnow().isoformat(timespec="seconds")
-    conn = get_conn()
-    changed = 0
-    for _, row in df.iterrows():
-        current = str(row.get("category") or "Lainnya")
-        if only_lainnya and current != "Lainnya":
-            continue
-        new_category = infer_category(row.get("description", ""), row.get("note", ""), str(row.get("type", "Keluar")))
-        if new_category and new_category != current:
-            conn.execute("UPDATE transactions SET category=?, updated_at=? WHERE id=?", (new_category, now, int(row["id"])))
-            changed += 1
-    conn.commit()
-    if changed:
-        sync_after_write(reason="recategorize_by_rules")
-    return changed
-
-
-def recategorize_by_keyword(keywords: List[str], new_category: str, only_lainnya: bool = True) -> int:
-    cleaned = [k.strip().lower() for k in keywords if k.strip()]
-    if not cleaned:
-        return 0
-    df = fetch_transactions()
-    if df.empty:
-        return 0
-    now = datetime.utcnow().isoformat(timespec="seconds")
-    conn = get_conn()
-    changed = 0
-    for _, row in df.iterrows():
-        current = str(row.get("category") or "Lainnya")
-        if only_lainnya and current != "Lainnya":
-            continue
-        haystack = f"{normalize_text(row.get('description', ''))} {normalize_text(row.get('note', ''))}"
-        if any(keyword in haystack for keyword in cleaned):
-            conn.execute("UPDATE transactions SET category=?, updated_at=? WHERE id=?", (new_category, now, int(row["id"])))
-            changed += 1
-    conn.commit()
-    if changed:
-        sync_after_write(reason="recategorize_by_keyword")
-    return changed
-
-
-def parse_date(value: Any) -> str:
-    parsed = parse_any_date(value)
-    if pd.isna(parsed):
         return date.today().isoformat()
-    return parsed.date().isoformat()
 
 
-def infer_swapped_source_month(df: pd.DataFrame) -> int:
-    """Infer the original month when old imports were parsed as MM/DD/YYYY.
-
-    Example wrong stored value: 2026-11-04. The day value (4) is likely the
-    original month, so the repaired value should be 2026-04-11.
-    """
-    if df.empty or "date" not in df.columns:
-        return int(date.today().month)
-    counts: Dict[int, int] = {}
-    for raw in df["date"].dropna().astype(str).tolist():
-        text = raw.strip()
-        if not ISO_DATE_RE.match(text):
-            continue
-        ts = pd.to_datetime(text[:10], format="%Y-%m-%d", errors="coerce")
-        if pd.isna(ts):
-            continue
-        # Only ambiguous dates can be flipped by an old month-first parser.
-        if 1 <= int(ts.day) <= 12 and 1 <= int(ts.month) <= 12 and int(ts.day) != int(ts.month):
-            counts[int(ts.day)] = counts.get(int(ts.day), 0) + 1
-    if counts:
-        return max(counts.items(), key=lambda item: item[1])[0]
-    return int(date.today().month)
-
-
-def swapped_date_candidates(df: pd.DataFrame, correct_month: int) -> pd.DataFrame:
-    """Return rows that look like old MM/DD parsing and can be safely previewed.
-
-    If correct_month is 4, a stored ISO date like 2026-11-04 is proposed as
-    2026-04-11. Correct dates like 2026-04-11 are not touched because the day is
-    11, not the selected correct month 4.
-    """
-    rows: List[Dict[str, Any]] = []
-    if df.empty or "date" not in df.columns:
-        return pd.DataFrame(rows)
-
-    for _, row in df.iterrows():
-        old_text = str(row.get("date") or "").strip()
-        if not ISO_DATE_RE.match(old_text):
-            continue
-        old_ts = pd.to_datetime(old_text[:10], format="%Y-%m-%d", errors="coerce")
-        if pd.isna(old_ts):
-            continue
-        old_day = int(old_ts.day)
-        old_month = int(old_ts.month)
-        if old_day != int(correct_month):
-            continue
-        if old_month == int(correct_month):
-            continue
-        if not (1 <= old_month <= 12):
-            continue
-        try:
-            new_ts = pd.Timestamp(year=int(old_ts.year), month=int(correct_month), day=old_month)
-        except Exception:
-            continue
-        rows.append(
-            {
-                "id": int(row.get("id")),
-                "Tanggal Lama": old_ts.strftime("%d/%m/%Y"),
-                "Tanggal Baru": new_ts.strftime("%d/%m/%Y"),
-                "date_lama_iso": old_ts.strftime("%Y-%m-%d"),
-                "date_baru_iso": new_ts.strftime("%Y-%m-%d"),
-                "Sumber Dana": row.get("fund", ""),
-                "Jenis": row.get("type", ""),
-                "Kategori": row.get("category", ""),
-                "Keterangan": row.get("description", ""),
-                "Nominal": int(row.get("amount") or 0),
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-def apply_swapped_date_fix(candidates: pd.DataFrame) -> int:
-    if candidates.empty:
-        return 0
-    conn = get_conn()
-    now = datetime.utcnow().isoformat(timespec="seconds")
-    changed = 0
-    for _, row in candidates.iterrows():
-        conn.execute(
-            "UPDATE transactions SET date=?, updated_at=? WHERE id=?",
-            (str(row["date_baru_iso"]), now, int(row["id"])),
-        )
-        changed += 1
-    conn.commit()
-    if changed:
-        sync_after_write(reason="date_fix_swapped")
-    return changed
-
-
-def _key_text(value: Any) -> str:
-    return re.sub(r"\s+", " ", str(value or "").strip().lower())
-
-
-def _tx_signature(row: Dict[str, Any]) -> Tuple[str, str, int, str]:
-    return (
-        _key_text(row.get("fund", "")),
-        _key_text(row.get("type", "")),
-        int(clean_amount(row.get("amount", 0))),
-        _key_text(row.get("description", "")),
-    )
-
-
-def _add_occurrence_keys(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str, int, str, int], Dict[str, Any]]:
-    counters: Dict[Tuple[str, str, int, str], int] = {}
-    keyed: Dict[Tuple[str, str, int, str, int], Dict[str, Any]] = {}
-    for row in rows:
-        sig = _tx_signature(row)
-        counters[sig] = counters.get(sig, 0) + 1
-        keyed[sig + (counters[sig],)] = row
-    return keyed
-
-
-def load_seed_transactions_for_date_repair() -> pd.DataFrame:
-    """Load the clean starting transactions used as the source of truth for dates.
-
-    This fixes the real issue where older app versions already saved 11/04/2026
-    as 2026-11-04 in SQLite. Merely changing display format cannot repair that.
-    The seed file is treated as the source of truth and dates are parsed as DD/MM/YYYY
-    or Excel serials.
-    """
-    tx_path = DATA_DIR / "seed_transactions.csv"
-    xlsx_path = DATA_DIR / "Rekap Kas Rumdin.xlsx"
+def format_date_id(value):
     try:
-        if tx_path.exists():
-            raw = pd.read_csv(tx_path)
-            rows = normalize_transactions_from_df(raw)
-            return pd.DataFrame(rows)
-        if xlsx_path.exists():
-            xl = pd.ExcelFile(xlsx_path)
-            sheet_name = "Master Kas" if "Master Kas" in xl.sheet_names else xl.sheet_names[0]
-            rows = normalize_transactions_from_df(pd.read_excel(xl, sheet_name=sheet_name))
-            return pd.DataFrame(rows)
+        return pd.to_datetime(value, errors="coerce").strftime("%d/%m/%Y")
     except Exception:
-        return pd.DataFrame()
-    return pd.DataFrame()
+        return ""
 
 
-def seed_date_repair_candidates(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame()
-    seed_df = load_seed_transactions_for_date_repair()
-    if seed_df.empty:
-        return pd.DataFrame()
-
-    seed_rows = seed_df.to_dict("records")
-    current_rows = df.to_dict("records")
-    seed_keyed = _add_occurrence_keys(seed_rows)
-    current_keyed = _add_occurrence_keys(current_rows)
-
-    rows: List[Dict[str, Any]] = []
-    for key, cur in current_keyed.items():
-        seed = seed_keyed.get(key)
-        if seed is None:
-            continue
-        cur_iso = parse_date(cur.get("date"))
-        seed_iso = parse_date(seed.get("date"))
-        if cur_iso == seed_iso:
-            continue
-        rows.append(
-            {
-                "id": int(cur.get("id")),
-                "Tanggal Lama": format_date_id(cur_iso),
-                "Tanggal Seharusnya": format_date_id(seed_iso),
-                "date_lama_iso": cur_iso,
-                "date_baru_iso": seed_iso,
-                "Sumber Dana": cur.get("fund", ""),
-                "Jenis": cur.get("type", ""),
-                "Kategori": cur.get("category", ""),
-                "Keterangan": cur.get("description", ""),
-                "Nominal": int(clean_amount(cur.get("amount", 0))),
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-def apply_seed_date_repair(candidates: pd.DataFrame) -> int:
-    if candidates.empty:
-        return 0
-    conn = get_conn()
-    now = datetime.utcnow().isoformat(timespec="seconds")
-    changed = 0
-    for _, row in candidates.iterrows():
-        conn.execute(
-            "UPDATE transactions SET date=?, updated_at=? WHERE id=?",
-            (str(row["date_baru_iso"]), now, int(row["id"])),
-        )
-        changed += 1
-    conn.execute(
-        "INSERT OR REPLACE INTO app_meta(key, value) VALUES('date_seed_repair_v48_applied_at', ?)",
-        (now,),
-    )
-    conn.commit()
-    if changed:
-        sync_after_write(reason="date_repair_from_seed")
-    return changed
-
-
-def auto_repair_dates_from_seed_once() -> None:
-    """Auto-fix old wrongly parsed seed dates once, without touching new custom rows."""
+def format_month_id(period):
     try:
-        conn = get_conn()
-        already = conn.execute(
-            "SELECT value FROM app_meta WHERE key='date_seed_repair_v48_applied_at'"
-        ).fetchone()
-        if already:
-            return
-        df = pd.DataFrame(run_query("SELECT * FROM transactions ORDER BY date ASC, id ASC"))
-        candidates = seed_date_repair_candidates(df)
-        if not candidates.empty:
-            apply_seed_date_repair(candidates)
-        else:
-            now = datetime.utcnow().isoformat(timespec="seconds")
-            conn.execute(
-                "INSERT OR REPLACE INTO app_meta(key, value) VALUES('date_seed_repair_v48_applied_at', ?)",
-                (now,),
-            )
-            conn.commit()
+        dt = pd.to_datetime(str(period) + "-01", errors="coerce")
+        if pd.isna(dt):
+            return str(period)
+        month_map = {
+            1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "Mei", 6: "Jun",
+            7: "Jul", 8: "Agu", 9: "Sep", 10: "Okt", 11: "Nov", 12: "Des"
+        }
+        return f"{month_map[int(dt.month)]} {int(dt.year)}"
     except Exception:
-        # Do not block app startup just because repair preview failed.
-        pass
+        return str(period)
 
 
-@st.cache_resource(show_spinner=False)
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+def rp(value):
+    value = parse_number(value, 0)
+    return f"Rp{value:,.0f}".replace(",", ".")
 
 
-def init_db() -> None:
-    conn = get_conn()
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT NOT NULL,
-            fund TEXT NOT NULL,
-            type TEXT NOT NULL CHECK(type IN ('Masuk', 'Keluar')),
-            amount INTEGER NOT NULL CHECK(amount >= 0),
-            category TEXT NOT NULL,
-            description TEXT NOT NULL,
-            method TEXT DEFAULT 'Kas',
-            note TEXT DEFAULT '',
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS budgets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            person TEXT NOT NULL,
-            component TEXT NOT NULL,
-            amount INTEGER NOT NULL CHECK(amount >= 0),
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS app_meta (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )
-        """
-    )
-    conn.commit()
-    restore_from_github_if_local_empty()
-    seed_if_empty()
-    auto_repair_dates_from_seed_once()
-    ensure_standard_budget_once()
-    if cloud_sync_enabled():
-        sync_local_db_to_github(reason="startup")
+def rp_compact(value):
+    value = parse_number(value, 0)
+    abs_value = abs(value)
+    sign = "-" if value < 0 else ""
+    if abs_value >= 1_000_000:
+        s = f"{abs_value/1_000_000:.1f}".replace(".", ",")
+        if s.endswith(",0"):
+            s = s[:-2]
+        return f"{sign}Rp{s} jt"
+    if abs_value >= 1_000:
+        s = f"{abs_value/1_000:.0f}"
+        return f"{sign}Rp{s} rb"
+    return f"{sign}Rp{abs_value:.0f}"
 
 
-def seed_if_empty() -> None:
-    conn = get_conn()
-    count = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
-    if count > 0:
-        return
-    now = datetime.utcnow().isoformat(timespec="seconds")
-    tx_path = DATA_DIR / "seed_transactions.csv"
-    bd_path = DATA_DIR / "seed_budgets.csv"
-    if tx_path.exists():
-        tx_df = pd.read_csv(tx_path)
-        for _, row in tx_df.iterrows():
-            conn.execute(
-                """
-                INSERT INTO transactions(date, fund, type, amount, category, description, method, note, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    parse_date(row.get("date")),
-                    str(row.get("fund", "Kas")),
-                    str(row.get("type", "Keluar")),
-                    clean_amount(row.get("amount")),
-                    str(row.get("category", "Lainnya")),
-                    str(row.get("description", "")),
-                    str(row.get("method", "Kas")),
-                    "" if pd.isna(row.get("note", "")) else str(row.get("note", "")),
-                    now,
-                    now,
-                ),
-            )
-    if bd_path.exists():
-        bd_df = pd.read_csv(bd_path)
-        for _, row in bd_df.iterrows():
-            conn.execute(
-                "INSERT INTO budgets(person, component, amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (str(row.get("person", "Kas")), str(row.get("component", "")), clean_amount(row.get("amount")), now, now),
-            )
-    conn.execute("INSERT OR REPLACE INTO app_meta(key, value) VALUES('seed_loaded_at', ?)", (now,))
-    conn.commit()
-
-
-def reset_db_from_seed_files() -> Tuple[int, int]:
-    """Replace all live data with data/seed_transactions.csv and data/seed_budgets.csv."""
-    tx_path = DATA_DIR / "seed_transactions.csv"
-    bd_path = DATA_DIR / "seed_budgets.csv"
-    if not tx_path.exists():
-        raise FileNotFoundError(f"File tidak ditemukan: {tx_path}")
-    if not bd_path.exists():
-        raise FileNotFoundError(f"File tidak ditemukan: {bd_path}")
-
-    tx_df = pd.read_csv(tx_path)
-    bd_df = pd.read_csv(bd_path)
-    conn = get_conn()
-    now = datetime.utcnow().isoformat(timespec="seconds")
-    tx_count = 0
-    bd_count = 0
-    with conn:
-        conn.execute("DELETE FROM transactions")
-        conn.execute("DELETE FROM budgets")
-        for _, row in tx_df.iterrows():
-            amount = clean_amount(row.get("amount"))
-            if amount <= 0:
-                continue
-            conn.execute(
-                """
-                INSERT INTO transactions(date, fund, type, amount, category, description, method, note, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    parse_date(row.get("date")),
-                    str(row.get("fund", DEFAULT_FUNDS[0])).strip() or DEFAULT_FUNDS[0],
-                    "Masuk" if str(row.get("type", "Keluar")).lower() == "masuk" else "Keluar",
-                    amount,
-                    str(row.get("category", "Lainnya")).strip() or "Lainnya",
-                    str(row.get("description", "Transaksi")).strip() or "Transaksi",
-                    str(row.get("method", "Kas")).strip() or "Kas",
-                    "" if pd.isna(row.get("note", "")) else str(row.get("note", "")).strip(),
-                    now,
-                    now,
-                ),
-            )
-            tx_count += 1
-        for _, row in bd_df.iterrows():
-            amount = clean_amount(row.get("amount"))
-            if amount <= 0:
-                continue
-            conn.execute(
-                "INSERT INTO budgets(person, component, amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (
-                    str(row.get("person", DEFAULT_FUNDS[0])).strip() or DEFAULT_FUNDS[0],
-                    str(row.get("component", "Kebutuhan")).strip() or "Kebutuhan",
-                    amount,
-                    now,
-                    now,
-                ),
-            )
-            bd_count += 1
-        conn.execute("INSERT OR REPLACE INTO app_meta(key, value) VALUES('seed_force_reset_at', ?)", (now,))
-        conn.execute("INSERT OR REPLACE INTO app_meta(key, value) VALUES('standard_budget_v51_applied_at', ?)", (now,))
-        conn.execute("INSERT OR REPLACE INTO app_meta(key, value) VALUES('date_seed_repair_v48_applied_at', ?)", (now,))
-    sync_after_write(reason="reset_from_seed_files")
-    return tx_count, bd_count
-
-
-def run_query(query: str, params: Iterable[Any] = ()) -> List[Dict[str, Any]]:
-    conn = get_conn()
-    rows = conn.execute(query, tuple(params)).fetchall()
-    return [dict(r) for r in rows]
-
-
-def execute(query: str, params: Iterable[Any] = ()) -> None:
-    conn = get_conn()
-    conn.execute(query, tuple(params))
-    conn.commit()
-    sync_after_write(reason="execute")
-
-
-def add_transaction(tx_date: str, fund: str, tx_type: str, amount: int, category: str, description: str, method: str = "Kas", note: str = "") -> None:
-    now = datetime.utcnow().isoformat(timespec="seconds")
-    execute(
-        """
-        INSERT INTO transactions(date, fund, type, amount, category, description, method, note, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (tx_date, fund, tx_type, amount, category, description, method, note, now, now),
-    )
-
-
-def update_transaction(tx_id: int, payload: Dict[str, Any]) -> None:
-    now = datetime.utcnow().isoformat(timespec="seconds")
-    execute(
-        """
-        UPDATE transactions
-        SET date=?, fund=?, type=?, amount=?, category=?, description=?, method=?, note=?, updated_at=?
-        WHERE id=?
-        """,
-        (
-            payload["date"],
-            payload["fund"],
-            payload["type"],
-            payload["amount"],
-            payload["category"],
-            payload["description"],
-            payload["method"],
-            payload["note"],
-            now,
-            tx_id,
-        ),
-    )
-
-
-def delete_transaction(tx_id: int) -> None:
-    execute("DELETE FROM transactions WHERE id=?", (tx_id,))
-
-
-def add_budget(person: str, component: str, amount: int) -> None:
-    now = datetime.utcnow().isoformat(timespec="seconds")
-    execute(
-        "INSERT INTO budgets(person, component, amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-        (person, component, amount, now, now),
-    )
-
-
-def delete_budget(budget_id: int) -> None:
-    execute("DELETE FROM budgets WHERE id=?", (budget_id,))
-
-
-def reset_standard_budgets(mark_meta: bool = True) -> None:
-    """Replace budget table with the agreed monthly budget for Rayhan and Azka."""
-    conn = get_conn()
-    now = datetime.utcnow().isoformat(timespec="seconds")
-    with conn:
-        conn.execute("DELETE FROM budgets")
-        for person, component, amount in DEFAULT_BUDGETS:
-            conn.execute(
-                "INSERT INTO budgets(person, component, amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (person, component, int(amount), now, now),
-            )
-        if mark_meta:
-            conn.execute(
-                "INSERT OR REPLACE INTO app_meta(key, value) VALUES('standard_budget_v51_applied_at', ?)",
-                (now,),
-            )
-    sync_after_write(reason="reset_standard_budgets")
-
-
-def ensure_standard_budget_once() -> None:
-    """One-time migration for deployed databases that still contain wrong budget rows."""
-    conn = get_conn()
-    try:
-        already = conn.execute(
-            "SELECT value FROM app_meta WHERE key='standard_budget_v51_applied_at'"
-        ).fetchone()
-        if already:
-            return
-        reset_standard_budgets(mark_meta=True)
-    except Exception:
-        pass
-
-
-def format_budget_number(value: Any) -> str:
-    try:
-        n = int(round(float(value or 0)))
-    except Exception:
-        n = 0
-    return f"{n:,}"
-
-
-def budget_table_for_person(budgets: pd.DataFrame, person: str) -> pd.DataFrame:
-    if budgets.empty:
-        base = pd.DataFrame(columns=["Komponen", "Total"])
-    else:
-        base = budgets[budgets["person"].astype(str).eq(person)].copy()
-        if base.empty:
-            base = pd.DataFrame(columns=["component", "amount"])
-        base = base[["component", "amount"]].rename(columns={"component": "Komponen", "amount": "Total"})
-    if not base.empty:
-        base["Total"] = base["Total"].apply(clean_amount)
-        base["_order"] = base["Komponen"].astype(str).map(BUDGET_COMPONENT_ORDER).fillna(99)
-        base = base.sort_values(["_order", "Komponen"]).drop(columns=["_order"])
-    total = int(base["Total"].sum()) if not base.empty else 0
-    out = base.copy()
-    out.loc[len(out)] = ["Total", total]
-    out["Total"] = out["Total"].apply(format_budget_number)
+def df_display(df, money_cols=None, date_cols=None):
+    out = df.copy()
+    money_cols = money_cols or []
+    date_cols = date_cols or []
+    for col in date_cols:
+        if col in out.columns:
+            out[col] = out[col].apply(format_date_id)
+    for col in money_cols:
+        if col in out.columns:
+            out[col] = out[col].apply(rp)
     return out
 
 
-def fetch_transactions() -> pd.DataFrame:
-    rows = run_query("SELECT * FROM transactions ORDER BY date ASC, id ASC")
-    if not rows:
-        return pd.DataFrame(columns=["id", "date", "fund", "type", "amount", "category", "description", "method", "note", "netto", "running_balance"])
-    df = pd.DataFrame(rows)
-    df["amount"] = df["amount"].astype(int)
-    df["netto"] = df.apply(lambda r: r["amount"] if r["type"] == "Masuk" else -r["amount"], axis=1)
-    df["running_balance"] = df.groupby("fund", sort=False)["netto"].cumsum()
+def show_df(df, height=None):
+    """Render dataframe safely across Streamlit versions.
+
+    Newer Streamlit versions can error when height=None is passed explicitly,
+    so height is only sent when it has a real value.
+    """
+    kwargs = {"use_container_width": True, "hide_index": True}
+    if height is not None:
+        kwargs["height"] = height
+
+    try:
+        st.dataframe(df, **kwargs)
+    except TypeError:
+        kwargs.pop("hide_index", None)
+        st.dataframe(df, **kwargs)
+
+
+def safe_toast(msg):
+    try:
+        st.toast(msg)
+    except Exception:
+        st.success(msg)
+
+
+def normalize_text(s):
+    return str(s or "").strip()
+
+
+def auto_category(description):
+    text = normalize_text(description).lower()
+    for cat, keywords in KEYWORD_RULES.items():
+        if any(k in text for k in keywords):
+            return cat
+    return "Lainnya"
+
+
+# ----------------------
+# SQLite
+# ----------------------
+def get_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with get_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                fund TEXT NOT NULL,
+                type TEXT NOT NULL,
+                amount REAL NOT NULL DEFAULT 0,
+                category TEXT NOT NULL DEFAULT 'Lainnya',
+                description TEXT NOT NULL DEFAULT '',
+                method TEXT NOT NULL DEFAULT 'Kas',
+                note TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS budgets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fund TEXT NOT NULL,
+                component TEXT NOT NULL,
+                amount REAL NOT NULL DEFAULT 0,
+                note TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        conn.commit()
+
+
+def table_count(table):
+    with get_conn() as conn:
+        return conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+
+
+def get_meta(key, default=None):
+    with get_conn() as conn:
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def set_meta(key, value):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
+        conn.commit()
+
+
+def read_transactions():
+    with get_conn() as conn:
+        df = pd.read_sql_query("SELECT * FROM transactions ORDER BY date, id", conn)
+    if df.empty:
+        return pd.DataFrame(columns=["id", "date", "fund", "type", "amount", "category", "description", "method", "note", "created_at", "updated_at"])
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
     return df
 
 
-def fetch_budgets() -> pd.DataFrame:
-    rows = run_query("SELECT * FROM budgets ORDER BY person ASC, component ASC, id ASC")
-    if not rows:
-        return pd.DataFrame(columns=["id", "person", "component", "amount"])
-    df = pd.DataFrame(rows)
-    df["amount"] = df["amount"].astype(int)
+def read_budgets():
+    with get_conn() as conn:
+        df = pd.read_sql_query("SELECT * FROM budgets ORDER BY fund, id", conn)
+    if df.empty:
+        return pd.DataFrame(columns=["id", "fund", "component", "amount", "note"])
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
     return df
 
 
-def get_fund_list(df: pd.DataFrame | None = None) -> List[str]:
-    funds = set(DEFAULT_FUNDS)
-    if df is not None and not df.empty and "fund" in df.columns:
-        funds.update([str(x) for x in df["fund"].dropna().unique().tolist()])
-    budget_df = fetch_budgets()
-    if not budget_df.empty:
-        funds.update([str(x) for x in budget_df["person"].dropna().unique().tolist()])
+def canonicalize_transactions_for_db(df):
+    """Normalize any transaction table into the internal schema.
+
+    This intentionally accepts both the raw/internal schema exported as CSV
+    and the Indonesian Excel/template schema used by users:
+    - date/Tanggal
+    - fund/Sumber Dana
+    - type/Jenis
+    - amount/Jumlah/Nominal OR Masuk/Keluar
+    - category/Kategori
+    - description/Keterangan
+    - method/Metode
+    - note/Catatan
+    """
+    columns = ["date", "fund", "type", "amount", "category", "description", "method", "note"]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=columns)
+
+    work = df.copy()
+    # Drop fully empty rows from edited Excel templates.
+    work = work.dropna(how="all")
+    if work.empty:
+        return pd.DataFrame(columns=columns)
+
+    colmap = {str(c).strip().lower(): c for c in work.columns}
+
+    def pick(*names):
+        for name in names:
+            key = str(name).strip().lower()
+            if key in colmap:
+                return colmap[key]
+        return None
+
+    date_col = pick("date", "tanggal")
+    fund_col = pick("fund", "sumber dana", "sumber_dana")
+    type_col = pick("type", "jenis")
+    amount_col = pick("amount", "jumlah", "nominal", "total")
+    masuk_col = pick("masuk", "pemasukan")
+    keluar_col = pick("keluar", "pengeluaran")
+    cat_col = pick("category", "kategori")
+    desc_col = pick("description", "keterangan", "uraian")
+    method_col = pick("method", "metode")
+    note_col = pick("note", "catatan")
+
+    rows = []
+    for _, r in work.iterrows():
+        raw_date = r.get(date_col) if date_col else None
+        raw_fund = r.get(fund_col) if fund_col else "Kas Azka"
+        raw_desc = r.get(desc_col) if desc_col else ""
+        raw_note = r.get(note_col) if note_col else ""
+
+        # Skip rows that are likely just blank separators/totals.
+        if (pd.isna(raw_date) if raw_date is not None else True) and normalize_text(raw_fund) == "" and normalize_text(raw_desc) == "":
+            continue
+        if normalize_text(raw_fund).lower() in ["total", "grand total"]:
+            continue
+
+        if amount_col:
+            amount = parse_number(r.get(amount_col), 0)
+            trx_type = normalize_text(r.get(type_col) if type_col else "")
+            if trx_type.lower() not in ["masuk", "keluar"]:
+                trx_type = "Masuk" if amount >= 0 else "Keluar"
+                amount = abs(amount)
+        else:
+            masuk = parse_number(r.get(masuk_col), 0) if masuk_col else 0
+            keluar = parse_number(r.get(keluar_col), 0) if keluar_col else 0
+            if masuk > 0 and keluar <= 0:
+                trx_type, amount = "Masuk", masuk
+            elif keluar > 0 and masuk <= 0:
+                trx_type, amount = "Keluar", keluar
+            elif masuk == 0 and keluar == 0:
+                # Keep zero rows only when they have a description/date.
+                trx_type, amount = "Keluar", 0
+            else:
+                if masuk >= keluar:
+                    trx_type, amount = "Masuk", masuk - keluar
+                else:
+                    trx_type, amount = "Keluar", keluar - masuk
+
+        trx_type = normalize_text(trx_type)
+        if trx_type.lower().startswith("m"):
+            trx_type = "Masuk"
+        elif trx_type.lower().startswith("k"):
+            trx_type = "Keluar"
+        else:
+            trx_type = "Keluar"
+
+        desc = normalize_text(raw_desc)
+        cat = normalize_text(r.get(cat_col) if cat_col else "") or auto_category(desc)
+        method = normalize_text(r.get(method_col) if method_col else "") or "Kas"
+        fund = normalize_text(raw_fund) or "Kas Azka"
+
+        rows.append({
+            "date": parse_date_any(raw_date),
+            "fund": fund,
+            "type": trx_type,
+            "amount": abs(parse_number(amount, 0)),
+            "category": cat,
+            "description": desc,
+            "method": method,
+            "note": normalize_text(raw_note),
+        })
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+def normalize_budgets_for_db(df):
+    columns = ["fund", "component", "amount", "note"]
+    if df is None or df.empty:
+        return pd.DataFrame(BUDGET_STANDARD)
+    work = df.copy().dropna(how="all")
+    if work.empty:
+        return pd.DataFrame(BUDGET_STANDARD)
+    colmap = {str(c).strip().lower(): c for c in work.columns}
+
+    def pick(*names):
+        for name in names:
+            key = str(name).strip().lower()
+            if key in colmap:
+                return colmap[key]
+        return None
+
+    fund_col = pick("fund", "sumber dana", "sumber_dana")
+    comp_col = pick("component", "komponen", "kategori", "item")
+    amount_col = pick("amount", "total", "nominal", "jumlah")
+    note_col = pick("note", "catatan")
+    rows = []
+    for _, r in work.iterrows():
+        fund = normalize_text(r.get(fund_col) if fund_col else "")
+        comp = normalize_text(r.get(comp_col) if comp_col else "")
+        if not fund or not comp or fund.lower() == "total" or comp.lower() == "total":
+            continue
+        rows.append({
+            "fund": fund,
+            "component": comp,
+            "amount": parse_number(r.get(amount_col), 0) if amount_col else 0,
+            "note": normalize_text(r.get(note_col) if note_col else ""),
+        })
+    return pd.DataFrame(rows, columns=columns) if rows else pd.DataFrame(BUDGET_STANDARD)
+
+
+def replace_transactions(df):
+    df = canonicalize_transactions_for_db(df)
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    rows = []
+    for _, r in df.iterrows():
+        rows.append((
+            parse_date_any(r.get("date")),
+            normalize_text(r.get("fund") or "Kas Azka"),
+            normalize_text(r.get("type") or "Keluar"),
+            parse_number(r.get("amount")),
+            normalize_text(r.get("category") or "Lainnya"),
+            normalize_text(r.get("description") or r.get("keterangan") or ""),
+            normalize_text(r.get("method") or "Kas"),
+            normalize_text(r.get("note") or r.get("catatan") or ""),
+            now,
+            now,
+        ))
+    with get_conn() as conn:
+        conn.execute("DELETE FROM transactions")
+        conn.executemany("""
+            INSERT INTO transactions(date, fund, type, amount, category, description, method, note, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, rows)
+        conn.commit()
+
+
+def append_transactions(df):
+    df = canonicalize_transactions_for_db(df)
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    rows = []
+    for _, r in df.iterrows():
+        rows.append((
+            parse_date_any(r.get("date")),
+            normalize_text(r.get("fund") or "Kas Azka"),
+            normalize_text(r.get("type") or "Keluar"),
+            parse_number(r.get("amount")),
+            normalize_text(r.get("category") or "Lainnya"),
+            normalize_text(r.get("description") or r.get("keterangan") or ""),
+            normalize_text(r.get("method") or "Kas"),
+            normalize_text(r.get("note") or r.get("catatan") or ""),
+            now,
+            now,
+        ))
+    with get_conn() as conn:
+        conn.executemany("""
+            INSERT INTO transactions(date, fund, type, amount, category, description, method, note, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, rows)
+        conn.commit()
+
+def add_transaction(date_value, fund, trx_type, amount, category, description, method="Kas", note=""):
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO transactions(date, fund, type, amount, category, description, method, note, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (parse_date_any(date_value), fund, trx_type, parse_number(amount), category, description, method, note, now, now))
+        conn.commit()
+    cloud_auto_backup()
+
+
+def update_transaction(trx_id, date_value, fund, trx_type, amount, category, description, method, note):
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    with get_conn() as conn:
+        conn.execute("""
+            UPDATE transactions
+            SET date=?, fund=?, type=?, amount=?, category=?, description=?, method=?, note=?, updated_at=?
+            WHERE id=?
+        """, (parse_date_any(date_value), fund, trx_type, parse_number(amount), category, description, method, note, now, int(trx_id)))
+        conn.commit()
+    cloud_auto_backup()
+
+
+def delete_transaction(trx_id):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM transactions WHERE id=?", (int(trx_id),))
+        conn.commit()
+    cloud_auto_backup()
+
+
+def add_budget(fund, component, amount, note=""):
+    with get_conn() as conn:
+        conn.execute("INSERT INTO budgets(fund, component, amount, note) VALUES (?, ?, ?, ?)", (fund, component, parse_number(amount), note))
+        conn.commit()
+    cloud_auto_backup()
+
+
+def update_budget(budget_id, fund, component, amount, note=""):
+    with get_conn() as conn:
+        conn.execute("UPDATE budgets SET fund=?, component=?, amount=?, note=? WHERE id=?", (fund, component, parse_number(amount), note, int(budget_id)))
+        conn.commit()
+    cloud_auto_backup()
+
+
+def delete_budget(budget_id):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM budgets WHERE id=?", (int(budget_id),))
+        conn.commit()
+    cloud_auto_backup()
+
+
+def seed_from_files(force=False):
+    if force or table_count("transactions") == 0:
+        if SEED_TX_PATH.exists():
+            tx = pd.read_csv(SEED_TX_PATH)
+            replace_transactions(tx)
+        elif SEED_XLSX_PATH.exists():
+            tx, bud = parse_excel_to_dataframes(SEED_XLSX_PATH)
+            replace_transactions(tx)
+            if table_count("budgets") == 0:
+                replace_budgets(bud)
+    if force or table_count("budgets") == 0:
+        if SEED_BUDGET_PATH.exists():
+            replace_budgets(pd.read_csv(SEED_BUDGET_PATH))
+        else:
+            reset_standard_budget()
+    set_meta("last_seed_at", datetime.utcnow().isoformat(timespec="seconds"))
+
+
+# ----------------------
+# Import / Export / Persistence
+# ----------------------
+def parse_excel_to_dataframes(file):
+    """Read Excel from either the import-ready template or older exports.
+
+    Supported transaction sheet names:
+    - Master Kas (preferred, import-ready)
+    - Transaksi (older export)
+    - first sheet fallback
+    Supported budget sheet names:
+    - Biaya Bulanan (preferred)
+    - Budget (older export)
+    """
+    xls = pd.ExcelFile(file)
+    sheets = xls.sheet_names
+
+    tx_sheet = None
+    for candidate in ["Master Kas", "Transaksi", "Transactions"]:
+        if candidate in sheets:
+            tx_sheet = candidate
+            break
+    if tx_sheet is None:
+        tx_sheet = sheets[0]
+
+    master = pd.read_excel(file, sheet_name=tx_sheet)
+    tx_df = canonicalize_transactions_for_db(master)
+
+    bud_df = pd.DataFrame(BUDGET_STANDARD)
+    budget_sheet = None
+    for candidate in ["Biaya Bulanan", "Budget", "Budgets"]:
+        if candidate in sheets:
+            budget_sheet = candidate
+            break
+    if budget_sheet:
+        try:
+            tmp = pd.read_excel(file, sheet_name=budget_sheet)
+            bud_df = normalize_budgets_for_db(tmp)
+        except Exception:
+            bud_df = pd.DataFrame(BUDGET_STANDARD)
+
+    return tx_df, bud_df
+
+def export_payload():
+    return {
+        "app": APP_TITLE,
+        "version": APP_VERSION,
+        "exported_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "transactions": read_transactions().to_dict(orient="records"),
+        "budgets": read_budgets().to_dict(orient="records"),
+    }
+
+
+def import_payload(payload, replace=True):
+    tx = pd.DataFrame(payload.get("transactions", []))
+    bud = pd.DataFrame(payload.get("budgets", []))
+    if replace:
+        if not tx.empty:
+            replace_transactions(tx)
+        if not bud.empty:
+            replace_budgets(bud)
+    else:
+        if not tx.empty:
+            append_transactions(tx)
+        if not bud.empty:
+            current = read_budgets()
+            replace_budgets(pd.concat([current[["fund", "component", "amount", "note"]], bud], ignore_index=True))
+    set_meta("last_import_at", datetime.utcnow().isoformat(timespec="seconds"))
+
+
+def make_master_kas_export(tx=None):
+    tx = read_transactions() if tx is None else tx.copy()
+    columns = ["Tanggal", "Sumber Dana", "Jenis", "Kategori", "Keterangan", "Metode", "Masuk", "Keluar", "Catatan"]
+    if tx.empty:
+        return pd.DataFrame(columns=columns)
+    out = tx.copy().sort_values(["date", "id"])
+    out["Tanggal"] = out["date"].apply(format_date_id)
+    out["Masuk"] = out.apply(lambda r: r["amount"] if r["type"] == "Masuk" else 0, axis=1)
+    out["Keluar"] = out.apply(lambda r: r["amount"] if r["type"] == "Keluar" else 0, axis=1)
+    out = out[["Tanggal", "fund", "type", "category", "description", "method", "Masuk", "Keluar", "note"]]
+    out.columns = columns
+    return out
+
+
+def make_budget_export(bud=None):
+    bud = read_budgets() if bud is None else bud.copy()
+    columns = ["Sumber Dana", "Komponen", "Total", "Catatan"]
+    if bud.empty:
+        bud = pd.DataFrame(BUDGET_STANDARD)
+    out = bud[["fund", "component", "amount", "note"]].copy()
+    out.columns = columns
+    return out
+
+
+def make_dashboard_summary(tx=None, bud=None):
+    tx = read_transactions() if tx is None else tx.copy()
+    bud = read_budgets() if bud is None else bud.copy()
+    rows = []
+    balances = balances_by_fund(tx)
+    total_saldo = balances["saldo"].sum() if not balances.empty else 0
+    total_masuk = tx.loc[tx["type"].eq("Masuk"), "amount"].sum() if not tx.empty else 0
+    total_keluar = tx.loc[tx["type"].eq("Keluar"), "amount"].sum() if not tx.empty else 0
+    rows.append({"Indikator": "Total Sisa Kas", "Nilai": total_saldo})
+    for fund in get_funds(tx):
+        val = balances.loc[balances["fund"].eq(fund), "saldo"].sum() if not balances.empty else 0
+        rows.append({"Indikator": f"Sisa {fund}", "Nilai": val})
+    rows.append({"Indikator": "Total Pemasukan", "Nilai": total_masuk})
+    rows.append({"Indikator": "Total Pengeluaran", "Nilai": total_keluar})
+    rows.append({"Indikator": "Budget Bulanan", "Nilai": bud["amount"].sum() if not bud.empty else 0})
+    return pd.DataFrame(rows)
+
+
+def make_excel_bytes():
+    """Export a workbook that is also safe to upload again.
+
+    The sheets `Master Kas` and `Biaya Bulanan` are intentionally formatted as
+    the import schema. The other sheets are for dashboard/reporting only.
+    """
+    output = io.BytesIO()
+    tx = read_transactions()
+    bud = read_budgets()
+    master = make_master_kas_export(tx)
+    budget_export = make_budget_export(bud)
+    dashboard = make_dashboard_summary(tx, bud)
+    movement = monthly_category_data(tx, ["Semua"], ["Semua"])
+    if not movement.empty:
+        movement_export = movement.copy()
+        movement_export["BulanSort"] = movement_export["BulanSort"].dt.strftime("%Y-%m")
+        movement_export = movement_export.rename(columns={"BulanSort": "Periode"})
+    else:
+        movement_export = pd.DataFrame(columns=["Periode", "Bulan", "Kategori", "Sumber Dana", "Total"])
+
+    readme = pd.DataFrame({
+        "Panduan": [
+            "File ini bisa dipakai untuk update data berikutnya.",
+            "Edit/tambah transaksi hanya di sheet Master Kas.",
+            "Jangan ubah nama sheet Master Kas dan Biaya Bulanan.",
+            "Tanggal wajib format DD/MM/YYYY, contoh 11/04/2026.",
+            "Untuk pemasukan isi kolom Masuk, untuk pengeluaran isi kolom Keluar.",
+            "Setelah selesai, upload file ini di menu Import / Export dengan mode Replace semua data.",
+        ]
+    })
+
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        master.to_excel(writer, index=False, sheet_name="Master Kas")
+        budget_export.to_excel(writer, index=False, sheet_name="Biaya Bulanan")
+        dashboard.to_excel(writer, index=False, sheet_name="Dashboard")
+        movement_export.to_excel(writer, index=False, sheet_name="Pergerakan Belanja")
+        readme.to_excel(writer, index=False, sheet_name="Panduan Import")
+
+        workbook = writer.book
+        money_fmt = workbook.add_format({"num_format": "#,##0"})
+        date_text_fmt = workbook.add_format({"num_format": "@"})
+        header_fmt = workbook.add_format({"bold": True, "bg_color": "#D9EAF7", "border": 1})
+
+        for sheet_name in writer.sheets:
+            ws = writer.sheets[sheet_name]
+            ws.freeze_panes(1, 0)
+            # Style header row.
+            if sheet_name == "Master Kas":
+                for i, col in enumerate(master.columns):
+                    ws.write(0, i, col, header_fmt)
+                ws.set_column("A:A", 14, date_text_fmt)
+                ws.set_column("B:F", 20)
+                ws.set_column("G:H", 15, money_fmt)
+                ws.set_column("I:I", 28)
+            elif sheet_name == "Biaya Bulanan":
+                for i, col in enumerate(budget_export.columns):
+                    ws.write(0, i, col, header_fmt)
+                ws.set_column("A:B", 20)
+                ws.set_column("C:C", 15, money_fmt)
+                ws.set_column("D:D", 28)
+            elif sheet_name == "Dashboard":
+                for i, col in enumerate(dashboard.columns):
+                    ws.write(0, i, col, header_fmt)
+                ws.set_column("A:A", 26)
+                ws.set_column("B:B", 18, money_fmt)
+            else:
+                ws.set_column(0, 8, 20)
+
+    output.seek(0)
+    return output.getvalue()
+
+def is_github_enabled():
+    provider = str(get_secret("PERSISTENCE_PROVIDER", "") or "").lower()
+    return provider == "github" and bool(get_secret("GITHUB_TOKEN")) and bool(get_secret("GITHUB_REPO"))
+
+
+def github_config():
+    return {
+        "token": get_secret("GITHUB_TOKEN", ""),
+        "repo": get_secret("GITHUB_REPO", ""),
+        "branch": get_secret("GITHUB_BRANCH", "main"),
+        "path": get_secret("GITHUB_DATA_FILE", "padebuolo_live_backup.json"),
+    }
+
+
+def github_headers(token):
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def github_get_file():
+    cfg = github_config()
+    url = f"https://api.github.com/repos/{cfg['repo']}/contents/{cfg['path']}"
+    res = requests.get(url, headers=github_headers(cfg["token"]), params={"ref": cfg["branch"]}, timeout=20)
+    if res.status_code == 404:
+        return None, None
+    res.raise_for_status()
+    data = res.json()
+    content = base64.b64decode(data.get("content", "")).decode("utf-8")
+    return json.loads(content), data.get("sha")
+
+
+def github_put_file(payload):
+    cfg = github_config()
+    url = f"https://api.github.com/repos/{cfg['repo']}/contents/{cfg['path']}"
+    _, sha = github_get_file()
+    body = {
+        "message": f"backup data Padebuolo {datetime.utcnow().isoformat(timespec='seconds')}",
+        "content": base64.b64encode(json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")).decode("utf-8"),
+        "branch": cfg["branch"],
+    }
+    if sha:
+        body["sha"] = sha
+    res = requests.put(url, headers=github_headers(cfg["token"]), json=body, timeout=30)
+    res.raise_for_status()
+    set_meta("last_cloud_backup_at", datetime.utcnow().isoformat(timespec="seconds"))
+    return res.json()
+
+
+def cloud_backup_now():
+    if not is_github_enabled():
+        return False, "GitHub backup belum dikonfigurasi di Secrets."
+    try:
+        github_put_file(export_payload())
+        return True, "Backup cloud berhasil disimpan."
+    except Exception as e:
+        return False, f"Backup cloud gagal: {type(e).__name__}: {e}"
+
+
+def cloud_restore_now():
+    if not is_github_enabled():
+        return False, "GitHub backup belum dikonfigurasi di Secrets."
+    try:
+        payload, _ = github_get_file()
+        if not payload:
+            return False, "File backup belum ada di repo data."
+        import_payload(payload, replace=True)
+        set_meta("last_cloud_restore_at", datetime.utcnow().isoformat(timespec="seconds"))
+        return True, "Restore dari cloud berhasil."
+    except Exception as e:
+        return False, f"Restore cloud gagal: {type(e).__name__}: {e}"
+
+
+def cloud_auto_backup():
+    if is_github_enabled():
+        try:
+            github_put_file(export_payload())
+        except Exception as e:
+            set_meta("last_cloud_backup_error", f"{type(e).__name__}: {e}")
+
+
+def first_boot_restore_or_seed():
+    init_db()
+    if get_meta("bootstrapped") == "1":
+        return
+    if is_github_enabled():
+        ok, msg = cloud_restore_now()
+        if ok and table_count("transactions") > 0:
+            set_meta("bootstrapped", "1")
+            return
+    seed_from_files(force=False)
+    set_meta("bootstrapped", "1")
+
+
+# ----------------------
+# Data views
+# ----------------------
+def get_funds(df=None):
+    funds = []
+    if df is None:
+        df = read_transactions()
+    if not df.empty:
+        funds.extend([x for x in df["fund"].dropna().unique().tolist() if x])
+    for f in FUNDS_DEFAULT:
+        if f not in funds:
+            funds.append(f)
     return sorted(funds)
 
 
-def summarize(df: pd.DataFrame) -> Dict[str, Any]:
+def get_categories(df=None):
+    cats = list(CATEGORIES)
+    if df is None:
+        df = read_transactions()
+    if not df.empty:
+        for c in df["category"].dropna().unique().tolist():
+            if c and c not in cats:
+                cats.append(c)
+    return cats
+
+
+def balances_by_fund(df):
     if df.empty:
-        return {
-            "total_in": 0,
-            "total_out": 0,
-            "saldo": 0,
-            "fund_balance": pd.DataFrame(columns=["fund", "saldo"]),
-            "monthly_out": pd.DataFrame(columns=["month", "keluar"]),
-            "category_out": pd.DataFrame(columns=["category", "keluar"]),
-        }
-    total_in = int(df.loc[df["type"] == "Masuk", "amount"].sum())
-    total_out = int(df.loc[df["type"] == "Keluar", "amount"].sum())
-    fund_balance = df.groupby("fund", as_index=False)["netto"].sum().rename(columns={"netto": "saldo"}).sort_values("saldo", ascending=False)
-    tmp = df.copy()
-    tmp["month"] = tmp["date"].apply(month_key_from_date)
-    monthly_out = tmp[tmp["type"] == "Keluar"].groupby("month", as_index=False)["amount"].sum().rename(columns={"amount": "keluar"})
-    category_out = tmp[tmp["type"] == "Keluar"].groupby("category", as_index=False)["amount"].sum().rename(columns={"amount": "keluar"}).sort_values("keluar", ascending=False)
-    return {
-        "total_in": total_in,
-        "total_out": total_out,
-        "saldo": total_in - total_out,
-        "fund_balance": fund_balance,
-        "monthly_out": monthly_out,
-        "category_out": category_out,
-    }
+        return pd.DataFrame(columns=["fund", "saldo"])
+    work = df.copy()
+    work["signed"] = work.apply(lambda r: r["amount"] if r["type"] == "Masuk" else -r["amount"], axis=1)
+    return work.groupby("fund", as_index=False)["signed"].sum().rename(columns={"signed": "saldo"})
 
 
-def display_df(df: pd.DataFrame, use_container_width: bool = True, hide_index: bool = True) -> None:
-    view = df.copy()
-    rename_map = {}
-    for col in list(view.columns):
-        if str(col).lower() == "date":
-            view[col] = view[col].apply(format_date_id)
-            rename_map[col] = "Tanggal"
-        elif str(col).lower() == "tanggal":
-            view[col] = view[col].apply(format_date_id)
-    if rename_map:
-        view = view.rename(columns=rename_map)
-    st.dataframe(view, use_container_width=use_container_width, hide_index=hide_index)
+def monthly_category_data(df, selected_categories=None, selected_funds=None):
+    """Return monthly expense movement with a real chronological sort key.
 
-
-def get_balance_by_fund_label(df: pd.DataFrame, label: str) -> int:
-    """Return current balance for a fund label using exact or loose matching."""
+    Important: the display label (Apr 2026, Mei 2026, etc.) must not be used
+    as the chart index because Streamlit/Altair can sort text labels
+    alphabetically. We keep BulanSort as an actual month-start Timestamp so
+    charts always run Apr -> Mei -> Jun -> Jul, etc.
+    """
+    cols = ["BulanSort", "Bulan", "Kategori", "Sumber Dana", "Total"]
     if df.empty:
-        return 0
-    fund_balance = summarize(df)["fund_balance"]
-    if fund_balance.empty:
-        return 0
+        return pd.DataFrame(columns=cols)
 
-    target = label.strip().lower()
-    fb = fund_balance.copy()
-    fb["fund_norm"] = fb["fund"].astype(str).str.strip().str.lower()
+    work = df.copy()
+    work = work[work["type"].eq("Keluar")].copy()
+    if selected_categories and "Semua" not in selected_categories:
+        work = work[work["category"].isin(selected_categories)]
+    if selected_funds and "Semua" not in selected_funds:
+        work = work[work["fund"].isin(selected_funds)]
+    if work.empty:
+        return pd.DataFrame(columns=cols)
 
-    exact = fb[fb["fund_norm"] == target]
-    if not exact.empty:
-        return int(exact["saldo"].sum())
+    work["date_dt"] = pd.to_datetime(work["date"], errors="coerce")
+    work = work.dropna(subset=["date_dt"])
+    if work.empty:
+        return pd.DataFrame(columns=cols)
 
-    loose = fb[fb["fund_norm"].str.contains(target, na=False)]
-    if not loose.empty:
-        return int(loose["saldo"].sum())
-    return 0
+    work["BulanSort"] = work["date_dt"].dt.to_period("M").dt.to_timestamp()
+    work["Bulan"] = work["BulanSort"].dt.to_period("M").astype(str).map(format_month_id)
 
-
-def ledger_view(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame()
-    out = df.copy().sort_values(["date", "id"]).copy()
-    out["Tanggal"] = out["date"].apply(format_date_id)
-    out["Sumber Dana"] = out["fund"]
-    out["Kategori"] = out["category"]
-    out["Keterangan"] = out["description"]
-    out["Masuk"] = out.apply(lambda r: compact_rp(r["amount"]) if r["type"] == "Masuk" else "-", axis=1)
-    out["Keluar"] = out.apply(lambda r: compact_rp(r["amount"]) if r["type"] == "Keluar" else "-", axis=1)
-    out["Netto"] = out["netto"].apply(compact_rp)
-    out["Metode"] = out["method"].fillna("Kas")
-    out["Catatan"] = out["note"].fillna("")
-    return out[["id", "Tanggal", "Sumber Dana", "Kategori", "Keterangan", "Masuk", "Keluar", "Netto", "Metode", "Catatan"]]
-
-
-def detail_ledger_view(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame()
-    out = df.copy().sort_values(["date", "id"]).copy()
-    out["Tanggal"] = out["date"].apply(format_date_id)
-    out["Masuk Detail"] = out.apply(lambda r: full_rp(r["amount"]) if r["type"] == "Masuk" else "-", axis=1)
-    out["Keluar Detail"] = out.apply(lambda r: full_rp(r["amount"]) if r["type"] == "Keluar" else "-", axis=1)
-    out["Netto Detail"] = out["netto"].apply(full_rp)
-    return out[["id", "Tanggal", "fund", "category", "description", "Masuk Detail", "Keluar Detail", "Netto Detail", "method", "note"]].rename(
-        columns={"fund": "Sumber Dana", "category": "Kategori", "description": "Keterangan", "method": "Metode", "note": "Catatan"}
-    )
-
-
-
-def monthly_category_summary(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Return monthly spending by category in long and pivot format."""
-    if df.empty:
-        empty_long = pd.DataFrame(columns=["Bulan", "Kategori", "Nominal"])
-        empty_pivot = pd.DataFrame()
-        return empty_long, empty_pivot
-
-    out = df[df["type"] == "Keluar"].copy()
-    if out.empty:
-        empty_long = pd.DataFrame(columns=["Bulan", "Kategori", "Nominal"])
-        empty_pivot = pd.DataFrame()
-        return empty_long, empty_pivot
-
-    out["tanggal_dt"] = out["date"].apply(parse_any_date)
-    out = out.dropna(subset=["tanggal_dt"])
-    if out.empty:
-        empty_long = pd.DataFrame(columns=["Bulan", "Kategori", "Nominal"])
-        empty_pivot = pd.DataFrame()
-        return empty_long, empty_pivot
-
-    out["BulanKey"] = out["tanggal_dt"].dt.to_period("M").astype(str)
-    out["Bulan"] = out["BulanKey"].apply(format_month_key_id)
-    out["Kategori"] = out["category"].fillna("Lainnya").astype(str)
-    grouped = (
-        out.groupby(["BulanKey", "Bulan", "Kategori"], as_index=False)["amount"]
+    agg = (
+        work.groupby(["BulanSort", "Bulan", "category", "fund"], as_index=False)["amount"]
         .sum()
-        .rename(columns={"amount": "Nominal"})
-        .sort_values(["BulanKey", "Kategori"])
+        .sort_values(["BulanSort", "category", "fund"])
     )
-    pivot_key = grouped.pivot_table(index="BulanKey", columns="Kategori", values="Nominal", aggfunc="sum", fill_value=0).sort_index()
-    pivot = pivot_key.copy()
-    pivot.index = [format_month_key_id(idx) for idx in pivot.index]
-    pivot.index.name = "Bulan"
-    pivot = pivot.astype(int)
-    return grouped[["Bulan", "Kategori", "Nominal"]], pivot
-
-def to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8-sig")
+    agg = agg.rename(columns={"category": "Kategori", "fund": "Sumber Dana", "amount": "Total"})
+    return agg[cols]
 
 
-def backup_json_bytes() -> bytes:
-    tx = fetch_transactions().drop(columns=["netto", "running_balance"], errors="ignore").to_dict(orient="records")
-    budgets = fetch_budgets().to_dict(orient="records")
-    payload = {
-        "exported_at": datetime.now().isoformat(timespec="seconds"),
-        "app": APP_TITLE,
-        "transactions": tx,
-        "budgets": budgets,
-    }
-    return json.dumps(payload, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+def filter_transactions(df, start=None, end=None, funds=None, types=None, cats=None, keyword=""):
+    if df.empty:
+        return df
+    work = df.copy()
+    work["date_dt"] = pd.to_datetime(work["date"], errors="coerce")
+    if start:
+        work = work[work["date_dt"] >= pd.to_datetime(start)]
+    if end:
+        work = work[work["date_dt"] <= pd.to_datetime(end)]
+    if funds and "Semua" not in funds:
+        work = work[work["fund"].isin(funds)]
+    if types and "Semua" not in types:
+        work = work[work["type"].isin(types)]
+    if cats and "Semua" not in cats:
+        work = work[work["category"].isin(cats)]
+    if keyword:
+        k = keyword.lower()
+        work = work[work["description"].str.lower().str.contains(k, na=False) | work["note"].str.lower().str.contains(k, na=False)]
+    return work.drop(columns=["date_dt"], errors="ignore")
 
 
-def export_excel_bytes() -> bytes:
-    tx = fetch_transactions()
-    budgets = fetch_budgets()
-    summary = summarize(tx)
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-        detail_ledger_view(tx).to_excel(writer, sheet_name="Buku Besar", index=False)
-        if not summary["fund_balance"].empty:
-            fb = summary["fund_balance"].copy()
-            fb["saldo_detail"] = fb["saldo"].apply(full_rp)
-            fb.to_excel(writer, sheet_name="Saldo Kas", index=False)
-        budgets.to_excel(writer, sheet_name="Budget Bulanan", index=False)
-        monthly_long, monthly_pivot = monthly_category_summary(tx)
-        if not monthly_long.empty:
-            monthly_long_export = monthly_long.copy()
-            monthly_long_export["Nominal Detail"] = monthly_long_export["Nominal"].apply(full_rp)
-            monthly_long_export.to_excel(writer, sheet_name="Belanja Bulanan", index=False)
-            monthly_pivot.to_excel(writer, sheet_name="Pivot Belanja Bulanan")
-        raw = tx.drop(columns=["netto", "running_balance"], errors="ignore").copy()
-        if "date" in raw.columns:
-            raw.insert(1, "Tanggal", raw["date"].apply(format_date_id))
-            raw.insert(2, "Tanggal Singkat", raw["date"].apply(format_date_short_id))
-        raw.to_excel(writer, sheet_name="Raw Transactions", index=False)
-    return buffer.getvalue()
-
-
-def normalize_transactions_from_df(df: pd.DataFrame) -> List[Dict[str, Any]]:
-    """Map common Excel/CSV formats into app transaction rows."""
-    if df is None or df.empty:
-        return []
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    lower_map = {c.lower(): c for c in df.columns}
-
-    def col(*names: str) -> str | None:
-        for name in names:
-            if name.lower() in lower_map:
-                return lower_map[name.lower()]
-        return None
-
-    c_date = col("date", "tanggal")
-    c_fund = col("fund", "sumber dana", "person")
-    c_type = col("type", "jenis")
-    c_amount = col("amount", "nominal")
-    c_in = col("masuk", "pemasukan")
-    c_out = col("keluar", "pengeluaran")
-    c_cat = col("category", "kategori")
-    c_desc = col("description", "keterangan", "uraian")
-    c_method = col("method", "metode")
-    c_note = col("note", "catatan")
-
-    rows: List[Dict[str, Any]] = []
-    for _, r in df.iterrows():
-        tx_date = parse_date(r.get(c_date)) if c_date else date.today().isoformat()
-        fund = str(r.get(c_fund, "Kas" if not DEFAULT_FUNDS else DEFAULT_FUNDS[0])).strip() if c_fund else DEFAULT_FUNDS[0]
-        category = str(r.get(c_cat, "Lainnya")).strip() if c_cat else "Lainnya"
-        description = str(r.get(c_desc, category)).strip() if c_desc else category
-        method = str(r.get(c_method, "Kas")).strip() if c_method else "Kas"
-        note = "" if not c_note or pd.isna(r.get(c_note)) else str(r.get(c_note)).strip()
-
-        if c_in or c_out:
-            masuk = clean_amount(r.get(c_in)) if c_in else 0
-            keluar = clean_amount(r.get(c_out)) if c_out else 0
-            if masuk > 0:
-                rows.append({"date": tx_date, "fund": fund, "type": "Masuk", "amount": masuk, "category": category or "Saldo Awal", "description": description or "Pemasukan", "method": method, "note": note})
-            if keluar > 0:
-                rows.append({"date": tx_date, "fund": fund, "type": "Keluar", "amount": keluar, "category": category or "Lainnya", "description": description or "Pengeluaran", "method": method, "note": note})
-        else:
-            tx_type = str(r.get(c_type, "Keluar")).strip().title() if c_type else "Keluar"
-            tx_type = "Masuk" if tx_type.lower() in {"masuk", "in", "income", "pemasukan"} else "Keluar"
-            amount = clean_amount(r.get(c_amount)) if c_amount else 0
-            if amount > 0:
-                rows.append({"date": tx_date, "fund": fund, "type": tx_type, "amount": amount, "category": category, "description": description, "method": method, "note": note})
-    return rows
-
-
-def normalize_budgets_from_df(df: pd.DataFrame) -> List[Dict[str, Any]]:
-    if df is None or df.empty:
-        return []
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    lower_map = {c.lower(): c for c in df.columns}
-
-    def col(*names: str) -> str | None:
-        for name in names:
-            if name.lower() in lower_map:
-                return lower_map[name.lower()]
-        return None
-
-    c_person = col("person", "sumber dana", "nama", "orang")
-    c_component = col("component", "komponen", "kebutuhan", "kategori")
-    c_amount = col("amount", "nominal", "biaya", "budget")
-    rows = []
-    for _, r in df.iterrows():
-        person = str(r.get(c_person, DEFAULT_FUNDS[0])).strip() if c_person else DEFAULT_FUNDS[0]
-        component = str(r.get(c_component, "Kebutuhan")).strip() if c_component else "Kebutuhan"
-        amount = clean_amount(r.get(c_amount)) if c_amount else 0
-        if amount > 0:
-            rows.append({"person": person, "component": component, "amount": amount})
-    return rows
-
-
-def import_rows(transactions: List[Dict[str, Any]], budgets: List[Dict[str, Any]], replace: bool = False) -> Tuple[int, int]:
-    conn = get_conn()
-    now = datetime.utcnow().isoformat(timespec="seconds")
-    if replace:
-        conn.execute("DELETE FROM transactions")
-        conn.execute("DELETE FROM budgets")
-    tx_count = 0
-    bd_count = 0
-    for tx in transactions:
-        amount = clean_amount(tx.get("amount"))
-        if amount <= 0:
-            continue
-        conn.execute(
-            """
-            INSERT INTO transactions(date, fund, type, amount, category, description, method, note, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                parse_date(tx.get("date")),
-                str(tx.get("fund", DEFAULT_FUNDS[0])).strip() or DEFAULT_FUNDS[0],
-                "Masuk" if str(tx.get("type", "Keluar")).lower() == "masuk" else "Keluar",
-                amount,
-                str(tx.get("category", "Lainnya")).strip() or "Lainnya",
-                str(tx.get("description", "Transaksi")).strip() or "Transaksi",
-                str(tx.get("method", "Kas")).strip() or "Kas",
-                str(tx.get("note", "")).strip(),
-                now,
-                now,
-            ),
-        )
-        tx_count += 1
-    for bd in budgets:
-        amount = clean_amount(bd.get("amount"))
-        if amount <= 0:
-            continue
-        conn.execute(
-            "INSERT INTO budgets(person, component, amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (str(bd.get("person", DEFAULT_FUNDS[0])).strip() or DEFAULT_FUNDS[0], str(bd.get("component", "Kebutuhan")).strip() or "Kebutuhan", amount, now, now),
-        )
-        bd_count += 1
-    conn.commit()
-    if tx_count or bd_count:
-        sync_after_write(reason="import_rows")
-    return tx_count, bd_count
-
-
-def render_login() -> bool:
-    password = get_config_value("APP_PASSWORD", DEFAULT_PASSWORD)
-    if password == "":
+# ----------------------
+# Pages
+# ----------------------
+def require_login():
+    password = get_secret("APP_PASSWORD", DEFAULT_PASSWORD)
+    if "logged_in" not in st.session_state:
+        st.session_state.logged_in = False
+    if st.session_state.logged_in:
         return True
-    if st.session_state.get("authenticated"):
-        return True
-    st.title("🏠 V.4 Padebuolo Next")
-    st.caption("Masuk dulu pak.")
+
+    st.title("🏠 V.6 Padebuolo Fresh")
+    st.caption("Aplikasi Kas Rumah Dinas")
     with st.form("login_form"):
-        user_input = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Masuk", type="primary")
+        pwd = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Masuk")
     if submitted:
-        if user_input == password:
-            st.session_state["authenticated"] = True
+        if pwd == password:
+            st.session_state.logged_in = True
             st.rerun()
         else:
             st.error("Password salah.")
+    st.info(f"Default password: `{DEFAULT_PASSWORD}`. Ganti via Streamlit Secrets `APP_PASSWORD`.")
     return False
 
 
-def page_dashboard(df: pd.DataFrame, budgets: pd.DataFrame) -> None:
-    st.title("🏠 Dashboard V.4 Padebuolo Next")
-    st.markdown("<div class='small-note'>Angka utama ditampilkan ringkas. Arahkan/keterangan help pada kartu atau buka detail angka untuk nominal penuh.</div>", unsafe_allow_html=True)
+def page_dashboard(df, budgets):
+    st.title("🏠 Dashboard Padebuolo")
+    balances = balances_by_fund(df)
+    total_saldo = balances["saldo"].sum() if not balances.empty else 0
+    total_masuk = df.loc[df["type"].eq("Masuk"), "amount"].sum() if not df.empty else 0
+    total_keluar = df.loc[df["type"].eq("Keluar"), "amount"].sum() if not df.empty else 0
 
-    s = summarize(df)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Saldo Kas", compact_rp(s["saldo"]), help=full_rp(s["saldo"]))
-    c2.metric("Total Masuk", compact_rp(s["total_in"]), help=full_rp(s["total_in"]))
-    c3.metric("Total Keluar", compact_rp(s["total_out"]), help=full_rp(s["total_out"]))
-    monthly_budget = int(budgets["amount"].sum()) if not budgets.empty else 0
-    est_month = (s["saldo"] / monthly_budget) if monthly_budget > 0 else 0
-    c4.metric("Estimasi Bertahan", f"{est_month:.1f} bulan" if monthly_budget > 0 else "-", help=f"Budget bulanan: {full_rp(monthly_budget)}")
+    cols = st.columns(4)
+    cols[0].metric("Total Sisa Kas", rp_compact(total_saldo), help=rp(total_saldo))
+    for i, fund in enumerate(["Kas Azka", "Kas Rayhan"], start=1):
+        val = balances.loc[balances["fund"].eq(fund), "saldo"].sum() if not balances.empty else 0
+        cols[i].metric(f"Sisa {fund.replace('Kas ', '')}", rp_compact(val), help=rp(val))
+    cols[3].metric("Total Keluar", rp_compact(total_keluar), help=rp(total_keluar))
 
     st.divider()
-    left, right = st.columns([1.1, 1])
-    with left:
-        st.subheader("Saldo per Sumber Dana")
-        fb = s["fund_balance"].copy()
-        if fb.empty:
-            st.info("Belum ada transaksi.")
-        else:
-            fb_display = fb.copy()
-            fb_display["Saldo"] = fb_display["saldo"].apply(compact_rp)
-            display_df(fb_display[["fund", "Saldo"]].rename(columns={"fund": "Sumber Dana"}))
-            chart_fb = fb.set_index("fund")[["saldo"]]
-            st.bar_chart(chart_fb)
-    with right:
-        st.subheader("Pengeluaran per Kategori")
-        cat = s["category_out"].head(8).copy()
-        if cat.empty:
-            st.info("Belum ada pengeluaran.")
-        else:
-            cat_display = cat.copy()
-            cat_display["Keluar"] = cat_display["keluar"].apply(compact_rp)
-            display_df(cat_display[["category", "Keluar"]].rename(columns={"category": "Kategori"}))
 
-    st.subheader("Tren Pengeluaran Bulanan")
-    monthly = s["monthly_out"].copy()
-    if monthly.empty:
-        st.info("Belum ada data bulanan.")
-    else:
-        st.line_chart(monthly.set_index("month")[["keluar"]])
+    if df.empty:
+        st.warning("Belum ada transaksi.")
+        return
 
-    with st.expander("Detail angka penuh"):
-        detail = {
-            "Saldo Kas": full_rp(s["saldo"]),
-            "Total Masuk": full_rp(s["total_in"]),
-            "Total Keluar": full_rp(s["total_out"]),
-            "Budget Bulanan": full_rp(monthly_budget),
-            "Estimasi Kas Bertahan": f"{est_month:.2f} bulan" if monthly_budget > 0 else "-",
-        }
-        display_df(pd.DataFrame(detail.items(), columns=["Indikator", "Detail"]))
+    work = df.copy()
+    work["date_dt"] = pd.to_datetime(work["date"], errors="coerce")
+    latest = work["date_dt"].max()
+    current_month = latest.to_period("M") if pd.notna(latest) else pd.Timestamp.today().to_period("M")
+    month_df = work[work["date_dt"].dt.to_period("M").eq(current_month)]
+    month_keluar = month_df.loc[month_df["type"].eq("Keluar"), "amount"].sum()
+    month_masuk = month_df.loc[month_df["type"].eq("Masuk"), "amount"].sum()
 
-
-def page_input(df: pd.DataFrame) -> None:
-    st.title("➕ Input Transaksi")
-    funds = get_fund_list(df)
-
-    st.subheader("Mode Cepat")
     c1, c2, c3 = st.columns(3)
-    quick_mode = c1.selectbox("Jenis input cepat", ["Inject Dana / Top Up", "Pengeluaran Split", "Transaksi Biasa"])
-    tx_date = date_input_id(c2, "Tanggal", value=date.today())
-    method = c3.selectbox("Metode", METHODS, index=0)
+    c1.metric(f"Keluar {format_month_id(str(current_month))}", rp_compact(month_keluar), help=rp(month_keluar))
+    c2.metric(f"Masuk {format_month_id(str(current_month))}", rp_compact(month_masuk), help=rp(month_masuk))
+    monthly_budget = budgets["amount"].sum() if not budgets.empty else 0
+    c3.metric("Budget Bulanan", rp_compact(monthly_budget), help=rp(monthly_budget))
 
-    if quick_mode == "Inject Dana / Top Up":
-        with st.form("inject_form", clear_on_submit=True):
-            col1, col2, col3 = st.columns([1, 1, 2])
-            fund = col1.selectbox("Masuk ke sumber dana", funds)
-            amount = col2.number_input("Nominal inject", min_value=0, step=10_000, format="%d")
-            description = col3.text_input("Keterangan", value=f"Inject dana {fund}")
-            note = st.text_area("Catatan", placeholder="Opsional")
-            submitted = st.form_submit_button("Simpan Inject Dana", type="primary")
-        if submitted:
-            if amount <= 0 or not description.strip():
-                st.error("Nominal dan keterangan wajib diisi.")
-            else:
-                add_transaction(tx_date.isoformat(), fund, "Masuk", int(amount), "Inject Dana / Top Up", description.strip(), method, note.strip())
-                st.success(f"Inject dana {compact_rp(amount)} ke {fund} tersimpan.")
-                st.rerun()
-
-    elif quick_mode == "Pengeluaran Split":
-        with st.form("split_form", clear_on_submit=True):
-            st.caption("Cocok buat belanja bareng. Nominal total akan dibagi rata/proporsi ke sumber dana terpilih.")
-            col1, col2 = st.columns([1.2, 1])
-            selected_funds = col1.multiselect("Dibagi ke", funds, default=funds[:2])
-            total_amount = col2.number_input("Nominal total", min_value=0, step=10_000, format="%d")
-            col3, col4 = st.columns([1, 2])
-            category = col3.selectbox("Kategori", CATEGORIES, index=CATEGORIES.index("Lainnya"))
-            description = col4.text_input("Keterangan", placeholder="Misal: Split beli galon / bayar internet")
-            note = st.text_area("Catatan", placeholder="Opsional")
-            submitted = st.form_submit_button("Simpan Split", type="primary")
-        if submitted:
-            if not selected_funds:
-                st.error("Pilih minimal satu sumber dana.")
-            elif total_amount <= 0 or not description.strip():
-                st.error("Nominal dan keterangan wajib diisi.")
-            else:
-                base = int(total_amount) // len(selected_funds)
-                remainder = int(total_amount) % len(selected_funds)
-                for idx, fund in enumerate(selected_funds):
-                    share = base + (1 if idx < remainder else 0)
-                    add_transaction(tx_date.isoformat(), fund, "Keluar", share, category, description.strip(), method, note.strip())
-                st.success(f"Split {compact_rp(total_amount)} untuk {len(selected_funds)} sumber dana tersimpan.")
-                st.rerun()
-
+    st.subheader("Belanja per Kategori")
+    expense = work[work["type"].eq("Keluar")].copy()
+    top = expense.groupby("category", as_index=False)["amount"].sum().sort_values("amount", ascending=False).head(8)
+    if not top.empty:
+        st.bar_chart(top.set_index("category")["amount"])
+        show_df(df_display(top.rename(columns={"category": "Kategori", "amount": "Total"}), money_cols=["Total"]))
     else:
-        with st.form("regular_form", clear_on_submit=True):
-            col1, col2, col3 = st.columns([1, 1, 1])
-            fund = col1.selectbox("Sumber dana", funds)
-            tx_type = col2.selectbox("Jenis", ["Keluar", "Masuk"])
-            amount = col3.number_input("Nominal", min_value=0, step=10_000, format="%d")
-            col4, col5 = st.columns([1, 2])
-            default_cat = "Lainnya" if tx_type == "Keluar" else "Iuran Bulanan"
-            category = col4.selectbox("Kategori", CATEGORIES, index=CATEGORIES.index(default_cat))
-            description = col5.text_input("Keterangan")
-            note = st.text_area("Catatan", placeholder="Opsional")
-            submitted = st.form_submit_button("Simpan Transaksi", type="primary")
+        st.info("Belum ada pengeluaran.")
+
+    st.subheader("Transaksi Terbaru")
+    recent = df.sort_values(["date", "id"], ascending=False).head(10)
+    recent["Masuk"] = recent.apply(lambda r: r["amount"] if r["type"] == "Masuk" else 0, axis=1)
+    recent["Keluar"] = recent.apply(lambda r: r["amount"] if r["type"] == "Keluar" else 0, axis=1)
+    recent_disp = recent[["date", "fund", "type", "category", "description", "Masuk", "Keluar", "note"]].rename(columns={
+        "date": "Tanggal", "fund": "Sumber Dana", "type": "Jenis", "category": "Kategori", "description": "Keterangan", "note": "Catatan"
+    })
+    show_df(df_display(recent_disp, money_cols=["Masuk", "Keluar"], date_cols=["Tanggal"]))
+
+
+def page_input(df):
+    st.title("➕ Input Transaksi")
+    funds = get_funds(df)
+    categories = get_categories(df)
+
+    tab1, tab2, tab3 = st.tabs(["Transaksi Biasa", "Inject Dana / Top Up", "Split Pengeluaran"])
+
+    with tab1:
+        with st.form("form_add_transaction"):
+            c1, c2, c3 = st.columns(3)
+            d = c1.date_input("Tanggal", value=date.today(), format="DD/MM/YYYY")
+            fund = c2.selectbox("Sumber Dana", funds)
+            trx_type = c3.selectbox("Jenis", ["Keluar", "Masuk"])
+
+            c4, c5 = st.columns(2)
+            amount = c4.number_input("Nominal", min_value=0, step=1000, format="%d")
+            category = c5.selectbox("Kategori", categories, index=categories.index("Lainnya") if "Lainnya" in categories else 0)
+
+            desc = st.text_input("Keterangan transaksi")
+            method = st.selectbox("Metode", METHODS)
+            note = st.text_area("Catatan tambahan", height=80)
+            submitted = st.form_submit_button("Simpan Transaksi")
         if submitted:
-            if amount <= 0 or not description.strip():
-                st.error("Nominal dan keterangan wajib diisi.")
+            if amount <= 0:
+                st.error("Nominal harus lebih dari 0.")
             else:
-                add_transaction(tx_date.isoformat(), fund, tx_type, int(amount), category, description.strip(), method, note.strip())
+                add_transaction(d, fund, trx_type, amount, category, desc, method, note)
                 st.success("Transaksi tersimpan.")
                 st.rerun()
 
+    with tab2:
+        with st.form("form_inject"):
+            c1, c2 = st.columns(2)
+            d = c1.date_input("Tanggal Top Up", value=date.today(), format="DD/MM/YYYY", key="inject_date")
+            fund = c2.selectbox("Sumber Dana", funds, key="inject_fund")
+            amount = st.number_input("Nominal Inject", min_value=0, step=1000, format="%d", key="inject_amount")
+            desc = st.text_input("Keterangan", value="Inject Dana")
+            note = st.text_area("Catatan", height=80, key="inject_note")
+            submitted = st.form_submit_button("Simpan Inject Dana")
+        if submitted:
+            if amount <= 0:
+                st.error("Nominal harus lebih dari 0.")
+            else:
+                add_transaction(d, fund, "Masuk", amount, "Inject Dana / Top Up", desc, "Kas", note)
+                st.success("Inject dana tersimpan.")
+                st.rerun()
 
-def page_ledger(df: pd.DataFrame) -> None:
+    with tab3:
+        with st.form("form_split"):
+            d = st.date_input("Tanggal", value=date.today(), format="DD/MM/YYYY", key="split_date")
+            desc = st.text_input("Keterangan", value="Split Pengeluaran")
+            total = st.number_input("Total Pengeluaran", min_value=0, step=1000, format="%d", key="split_total")
+            category = st.selectbox("Kategori", categories, index=categories.index("Lainnya") if "Lainnya" in categories else 0, key="split_cat")
+            participants = st.multiselect("Peserta Split", funds, default=[f for f in funds if f in ["Kas Azka", "Kas Rayhan"]])
+            mode = st.radio("Pembagian", ["Rata", "Manual"], horizontal=True)
+            manual = {}
+            if mode == "Manual":
+                st.caption("Isi nominal masing-masing. Total manual sebaiknya sama dengan total pengeluaran.")
+                for p in participants:
+                    manual[p] = st.number_input(f"Nominal {p}", min_value=0, step=1000, format="%d", key=f"manual_{p}")
+            note = st.text_area("Catatan", height=80, key="split_note")
+            submitted = st.form_submit_button("Simpan Split")
+        if submitted:
+            if total <= 0 or not participants:
+                st.error("Total harus lebih dari 0 dan peserta harus dipilih.")
+            else:
+                if mode == "Rata":
+                    share = round(total / len(participants))
+                    amounts = {p: share for p in participants}
+                    # adjust rounding to first participant
+                    amounts[participants[0]] += total - sum(amounts.values())
+                else:
+                    amounts = manual
+                    if sum(amounts.values()) != total:
+                        st.warning(f"Total manual {rp(sum(amounts.values()))}, total pengeluaran {rp(total)}. Tetap disimpan sesuai nominal manual.")
+                for p, amt in amounts.items():
+                    if amt > 0:
+                        add_transaction(d, p, "Keluar", amt, category, desc, "Kas", note)
+                st.success("Split pengeluaran tersimpan.")
+                st.rerun()
+
+
+def page_buku_besar(df):
     st.title("📒 Buku Besar")
-    if df.empty:
-        st.info("Belum ada transaksi.")
-        return
-
-    st.subheader("Rekap Sisa Kas")
-    azka_balance = get_balance_by_fund_label(df, "Azka")
-    rayhan_balance = get_balance_by_fund_label(df, "Rayhan")
-    total_balance = summarize(df)["saldo"]
+    balances = balances_by_fund(df)
     c1, c2, c3 = st.columns(3)
-    c1.metric("Sisa Kas Azka", compact_rp(azka_balance), help=full_rp(azka_balance))
-    c2.metric("Sisa Kas Rayhan", compact_rp(rayhan_balance), help=full_rp(rayhan_balance))
-    c3.metric("Total Sisa Kas", compact_rp(total_balance), help=full_rp(total_balance))
-    st.caption("Rekap sisa kas dihitung dari seluruh transaksi masuk dikurangi keluar per sumber dana. Tabel buku besar di bawah hanya menampilkan transaksi, bukan saldo berjalan per baris.")
+    for col, fund in zip([c1, c2], ["Kas Azka", "Kas Rayhan"]):
+        val = balances.loc[balances["fund"].eq(fund), "saldo"].sum() if not balances.empty else 0
+        col.metric(f"Sisa {fund.replace('Kas ', '')}", rp_compact(val), help=rp(val))
+    c3.metric("Total Sisa Kas", rp_compact(balances["saldo"].sum() if not balances.empty else 0), help=rp(balances["saldo"].sum() if not balances.empty else 0))
 
-    filters = st.container(border=True)
-    with filters:
-        c1, c2, c3, c4 = st.columns([1, 1, 1, 1.4])
-        funds = ["Semua"] + get_fund_list(df)
-        selected_fund = c1.selectbox("Sumber dana", funds)
-        selected_type = c2.selectbox("Jenis", ["Semua", "Masuk", "Keluar"])
-        selected_category = c3.selectbox("Kategori", ["Semua"] + sorted(df["category"].dropna().astype(str).unique().tolist()))
-        keyword = c4.text_input("Cari keterangan/catatan")
-
-    fdf = df.copy()
-    if selected_fund != "Semua":
-        fdf = fdf[fdf["fund"] == selected_fund]
-    if selected_type != "Semua":
-        fdf = fdf[fdf["type"] == selected_type]
-    if selected_category != "Semua":
-        fdf = fdf[fdf["category"] == selected_category]
-    if keyword.strip():
-        kw = keyword.strip().lower()
-        fdf = fdf[fdf["description"].str.lower().str.contains(kw, na=False) | fdf["note"].fillna("").str.lower().str.contains(kw, na=False)]
-
-    st.caption("Buku besar transaksi: Masuk, Keluar, dan Netto. Sisa kas ditaruh sebagai rekap di atas supaya tidak membingungkan per baris.")
-    display_df(ledger_view(fdf))
-
-    with st.expander("Lihat nominal penuh"):
-        display_df(detail_ledger_view(fdf))
-
-    st.divider()
-    st.subheader("Edit / Hapus Transaksi")
-    tx_ids = fdf["id"].astype(int).tolist()
-    if not tx_ids:
-        st.info("Tidak ada transaksi sesuai filter.")
+    if df.empty:
+        st.warning("Belum ada transaksi.")
         return
-    selected_id = st.selectbox("Pilih ID transaksi", tx_ids, format_func=lambda x: f"ID {x}")
-    row = df[df["id"] == selected_id].iloc[0].to_dict()
-    with st.form("edit_tx_form"):
+
+    work = df.copy()
+    min_d = pd.to_datetime(work["date"]).min().date()
+    max_d = pd.to_datetime(work["date"]).max().date()
+    with st.expander("Filter", expanded=True):
         c1, c2, c3 = st.columns(3)
-        tx_date = date_input_id(c1, "Tanggal", value=parse_any_date(row["date"]).date(), key="edit_date")
-        fund = c2.text_input("Sumber dana", value=str(row["fund"]))
-        tx_type = c3.selectbox("Jenis", ["Masuk", "Keluar"], index=0 if row["type"] == "Masuk" else 1)
-        c4, c5, c6 = st.columns([1, 1, 2])
-        amount = c4.number_input("Nominal", min_value=0, value=int(row["amount"]), step=10_000, format="%d")
-        category = c5.selectbox("Kategori", CATEGORIES, index=CATEGORIES.index(row["category"]) if row["category"] in CATEGORIES else CATEGORIES.index("Lainnya"))
-        description = c6.text_input("Keterangan", value=str(row["description"]))
-        c7, c8 = st.columns([1, 2])
-        method = c7.selectbox("Metode", METHODS, index=METHODS.index(row.get("method") or "Kas") if (row.get("method") or "Kas") in METHODS else 0)
-        note = c8.text_input("Catatan", value=str(row.get("note") or ""))
-        save, delete = st.columns([1, 1])
-        submitted = save.form_submit_button("Simpan Perubahan", type="primary")
-        deleted = delete.form_submit_button("Hapus Transaksi")
-    if submitted:
-        if amount <= 0 or not description.strip() or not fund.strip():
-            st.error("Sumber dana, nominal, dan keterangan wajib diisi.")
-        else:
-            update_transaction(
-                int(selected_id),
-                {
-                    "date": tx_date.isoformat(),
-                    "fund": fund.strip(),
-                    "type": tx_type,
-                    "amount": int(amount),
-                    "category": category,
-                    "description": description.strip(),
-                    "method": method,
-                    "note": note.strip(),
-                },
-            )
-            st.success("Transaksi berhasil diubah.")
+        start = c1.date_input("Tanggal awal", value=min_d, format="DD/MM/YYYY")
+        end = c2.date_input("Tanggal akhir", value=max_d, format="DD/MM/YYYY")
+        keyword = c3.text_input("Cari keterangan/catatan")
+        c4, c5, c6 = st.columns(3)
+        funds = c4.multiselect("Sumber dana", ["Semua"] + get_funds(df), default=["Semua"])
+        types = c5.multiselect("Jenis", ["Semua", "Masuk", "Keluar"], default=["Semua"])
+        cats = c6.multiselect("Kategori", ["Semua"] + get_categories(df), default=["Semua"])
+
+    filt = filter_transactions(df, start, end, funds, types, cats, keyword)
+    show = filt.copy()
+    show["Masuk"] = show.apply(lambda r: r["amount"] if r["type"] == "Masuk" else 0, axis=1)
+    show["Keluar"] = show.apply(lambda r: r["amount"] if r["type"] == "Keluar" else 0, axis=1)
+    show["Netto"] = show["Masuk"] - show["Keluar"]
+    display = show[["id", "date", "fund", "type", "category", "description", "Masuk", "Keluar", "Netto", "note"]].rename(columns={
+        "id": "ID", "date": "Tanggal", "fund": "Sumber Dana", "type": "Jenis", "category": "Kategori", "description": "Keterangan", "note": "Catatan"
+    })
+    show_df(df_display(display, money_cols=["Masuk", "Keluar", "Netto"], date_cols=["Tanggal"]), height=480)
+
+    with st.expander("Edit / Hapus Transaksi"):
+        if filt.empty:
+            st.info("Tidak ada transaksi sesuai filter.")
+            return
+        ids = filt["id"].astype(int).tolist()
+        trx_id = st.selectbox("Pilih ID transaksi", ids)
+        row = df[df["id"].eq(trx_id)].iloc[0]
+        with st.form("form_edit_trx"):
+            c1, c2, c3 = st.columns(3)
+            d = c1.date_input("Tanggal", value=pd.to_datetime(row["date"]).date(), format="DD/MM/YYYY", key="edit_date")
+            fund = c2.selectbox("Sumber Dana", get_funds(df), index=get_funds(df).index(row["fund"]) if row["fund"] in get_funds(df) else 0)
+            trx_type = c3.selectbox("Jenis", ["Keluar", "Masuk"], index=["Keluar", "Masuk"].index(row["type"]) if row["type"] in ["Keluar", "Masuk"] else 0)
+            c4, c5 = st.columns(2)
+            amount = c4.number_input("Nominal", min_value=0, step=1000, value=int(row["amount"]), format="%d", key="edit_amount")
+            cats = get_categories(df)
+            category = c5.selectbox("Kategori", cats, index=cats.index(row["category"]) if row["category"] in cats else cats.index("Lainnya"))
+            desc = st.text_input("Keterangan", value=row["description"])
+            method = st.selectbox("Metode", METHODS, index=METHODS.index(row["method"]) if row["method"] in METHODS else 0)
+            note = st.text_area("Catatan", value=row["note"], height=80)
+            save = st.form_submit_button("Simpan Perubahan")
+        if save:
+            update_transaction(trx_id, d, fund, trx_type, amount, category, desc, method, note)
+            st.success("Transaksi berhasil diupdate.")
             st.rerun()
-    if deleted:
-        delete_transaction(int(selected_id))
-        st.warning("Transaksi dihapus.")
-        st.rerun()
+
+        st.warning("Hapus transaksi tidak bisa dibatalkan.")
+        confirm_delete = st.checkbox("Saya yakin mau hapus transaksi ini", key=f"del_confirm_{trx_id}")
+        if st.button("Hapus Transaksi", disabled=not confirm_delete):
+            delete_transaction(trx_id)
+            st.success("Transaksi dihapus.")
+            st.rerun()
 
 
-
-def page_monthly_category(df: pd.DataFrame) -> None:
-    st.title("📊 Pergerakan Belanja Bulanan per Kategori")
-    st.caption("Menu ini khusus membaca transaksi jenis Keluar, lalu mengelompokkan pengeluaran per bulan dan kategori belanja.")
-
+def page_kategorisasi(df):
+    st.title("🏷️ Kategorisasi Massal")
     if df.empty:
-        st.info("Belum ada transaksi.")
+        st.warning("Belum ada transaksi.")
         return
 
-    out = df[df["type"] == "Keluar"].copy()
-    if out.empty:
-        st.info("Belum ada transaksi pengeluaran.")
-        return
-
-    out["tanggal_dt"] = out["date"].apply(parse_any_date)
-    out = out.dropna(subset=["tanggal_dt"])
-    if out.empty:
-        st.warning("Tanggal transaksi belum bisa dibaca. Cek format tanggal di data transaksi.")
-        return
-
-    out["BulanKey"] = out["tanggal_dt"].dt.to_period("M").astype(str)
-    available_months = sorted(out["BulanKey"].dropna().astype(str).unique().tolist())
-    available_categories = sorted(out["category"].fillna("Lainnya").astype(str).unique().tolist())
-
-    with st.container(border=True):
-        c1, c2, c3, c4 = st.columns([1, 1, 1.3, 1])
-        start_month = c1.selectbox("Dari bulan", available_months, index=0, format_func=format_month_key_id)
-        end_month = c2.selectbox("Sampai bulan", available_months, index=len(available_months) - 1, format_func=format_month_key_id)
-        selected_categories = c3.multiselect("Kategori", available_categories, default=available_categories)
-        selected_fund = c4.selectbox("Sumber dana", ["Semua"] + get_fund_list(df), index=0)
-
-    if start_month > end_month:
-        st.error("Bulan awal tidak boleh lebih besar dari bulan akhir.")
-        return
-
-    fdf = out[(out["BulanKey"] >= start_month) & (out["BulanKey"] <= end_month)].copy()
-    if selected_fund != "Semua":
-        fdf = fdf[fdf["fund"] == selected_fund]
-    if selected_categories:
-        fdf = fdf[fdf["category"].isin(selected_categories)]
+    st.subheader("Auto-kategorisasi")
+    only_lainnya = st.checkbox("Hanya ubah transaksi yang kategorinya masih Lainnya", value=True)
+    candidate = df.copy()
+    if only_lainnya:
+        candidate = candidate[candidate["category"].eq("Lainnya")]
+    candidate["Kategori Usulan"] = candidate["description"].apply(auto_category)
+    candidate = candidate[candidate["Kategori Usulan"].ne("Lainnya")]
+    st.caption(f"Transaksi yang bisa dikategorikan otomatis: {len(candidate)}")
+    if not candidate.empty:
+        preview = candidate[["id", "date", "fund", "description", "category", "Kategori Usulan"]].rename(columns={
+            "id": "ID", "date": "Tanggal", "fund": "Sumber Dana", "description": "Keterangan", "category": "Kategori Lama"
+        })
+        show_df(df_display(preview, date_cols=["Tanggal"]))
+        if st.button("Terapkan Auto-kategorisasi"):
+            with get_conn() as conn:
+                for _, r in candidate.iterrows():
+                    conn.execute("UPDATE transactions SET category=?, updated_at=? WHERE id=?", (r["Kategori Usulan"], datetime.utcnow().isoformat(timespec="seconds"), int(r["id"])))
+                conn.commit()
+            cloud_auto_backup()
+            st.success(f"{len(candidate)} transaksi berhasil dikategorikan.")
+            st.rerun()
     else:
-        st.warning("Pilih minimal satu kategori.")
-        return
-
-    if fdf.empty:
-        st.info("Tidak ada pengeluaran sesuai filter.")
-        return
-
-    grouped, pivot = monthly_category_summary(fdf)
-    total_spending = int(fdf["amount"].sum())
-    monthly_total = pivot.sum(axis=1).sort_values(ascending=False) if not pivot.empty else pd.Series(dtype="int64")
-    category_total = pivot.sum(axis=0).sort_values(ascending=False) if not pivot.empty else pd.Series(dtype="int64")
-
-    biggest_month = monthly_total.index[0] if not monthly_total.empty else "-"
-    biggest_month_value = int(monthly_total.iloc[0]) if not monthly_total.empty else 0
-    biggest_category = category_total.index[0] if not category_total.empty else "-"
-    biggest_category_value = int(category_total.iloc[0]) if not category_total.empty else 0
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Belanja", compact_rp(total_spending), help=full_rp(total_spending))
-    c2.metric("Bulan Belanja Tertinggi", biggest_month, help=full_rp(biggest_month_value))
-    c3.metric("Kategori Terbesar", biggest_category, help=full_rp(biggest_category_value))
+        st.info("Tidak ada kandidat auto-kategorisasi.")
 
     st.divider()
-    st.subheader("Grafik Pergerakan Bulanan")
-    chart_type = st.radio("Jenis grafik", ["Line chart", "Bar chart"], horizontal=True)
+    st.subheader("Ubah berdasarkan keyword sendiri")
+    with st.form("keyword_category"):
+        keywords = st.text_input("Keyword, pisahkan dengan koma", placeholder="contoh: indihome, wifi, internet")
+        new_cat = st.selectbox("Kategori tujuan", get_categories(df))
+        only_lainnya2 = st.checkbox("Hanya ubah yang masih Lainnya", value=True, key="only_lainnya2")
+        submitted = st.form_submit_button("Terapkan Keyword")
+    if submitted:
+        words = [w.strip().lower() for w in keywords.split(",") if w.strip()]
+        if not words:
+            st.error("Keyword belum diisi.")
+        else:
+            target = df.copy()
+            if only_lainnya2:
+                target = target[target["category"].eq("Lainnya")]
+            mask = target["description"].str.lower().apply(lambda x: any(w in str(x) for w in words))
+            ids = target.loc[mask, "id"].tolist()
+            with get_conn() as conn:
+                for tid in ids:
+                    conn.execute("UPDATE transactions SET category=?, updated_at=? WHERE id=?", (new_cat, datetime.utcnow().isoformat(timespec="seconds"), int(tid)))
+                conn.commit()
+            cloud_auto_backup()
+            st.success(f"{len(ids)} transaksi diubah ke kategori {new_cat}.")
+            st.rerun()
+
+
+def page_budget(df, budgets):
+    st.title("📅 Budget Bulanan")
+    st.caption("Budget standar Padebuolo: Rayhan Rp715.000 dan Azka Rp760.000 per bulan.")
+
+    if budgets.empty:
+        st.warning("Budget belum ada.")
+    else:
+        for fund in ["Kas Rayhan", "Kas Azka"]:
+            sub = budgets[budgets["fund"].eq(fund)].copy()
+            st.subheader(fund)
+            total = sub["amount"].sum()
+            st.metric("Total Budget", rp_compact(total), help=rp(total))
+            disp = sub[["component", "amount", "note"]].rename(columns={"component": "Komponen", "amount": "Total", "note": "Catatan"})
+            show_df(df_display(disp, money_cols=["Total"]))
+
+        total_all = budgets["amount"].sum()
+        st.info(f"Total budget bulanan seluruh kas: **{rp(total_all)}**")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Reset ke Budget Standar Padebuolo"):
+            reset_standard_budget()
+            cloud_auto_backup()
+            st.success("Budget direset ke standar Padebuolo.")
+            st.rerun()
+
+    with st.expander("Tambah / Edit / Hapus Budget"):
+        mode = st.radio("Mode", ["Tambah", "Edit", "Hapus"], horizontal=True)
+        funds = get_funds(df)
+        if mode == "Tambah":
+            with st.form("add_budget"):
+                fund = st.selectbox("Sumber Dana", funds)
+                comp = st.text_input("Komponen")
+                amount = st.number_input("Nominal", min_value=0, step=1000, format="%d")
+                note = st.text_input("Catatan")
+                submitted = st.form_submit_button("Tambah Budget")
+            if submitted:
+                add_budget(fund, comp, amount, note)
+                st.success("Budget ditambahkan.")
+                st.rerun()
+        elif mode == "Edit" and not budgets.empty:
+            bid = st.selectbox("Pilih ID Budget", budgets["id"].astype(int).tolist())
+            row = budgets[budgets["id"].eq(bid)].iloc[0]
+            with st.form("edit_budget"):
+                fund = st.selectbox("Sumber Dana", funds, index=funds.index(row["fund"]) if row["fund"] in funds else 0)
+                comp = st.text_input("Komponen", value=row["component"])
+                amount = st.number_input("Nominal", min_value=0, step=1000, value=int(row["amount"]), format="%d")
+                note = st.text_input("Catatan", value=row["note"])
+                submitted = st.form_submit_button("Simpan Budget")
+            if submitted:
+                update_budget(bid, fund, comp, amount, note)
+                st.success("Budget diupdate.")
+                st.rerun()
+        elif mode == "Hapus" and not budgets.empty:
+            bid = st.selectbox("Pilih ID Budget", budgets["id"].astype(int).tolist(), key="hapus_budget_id")
+            if st.button("Hapus Budget"):
+                delete_budget(bid)
+                st.success("Budget dihapus.")
+                st.rerun()
+
+
+def page_pergerakan(df):
+    st.title("📈 Pergerakan Belanja Bulanan")
+    if df.empty:
+        st.warning("Belum ada transaksi.")
+        return
+    expense = df[df["type"].eq("Keluar")].copy()
+    if expense.empty:
+        st.info("Belum ada pengeluaran.")
+        return
+
+    expense["date_dt"] = pd.to_datetime(expense["date"], errors="coerce")
+    expense = expense.dropna(subset=["date_dt"]).copy()
+    if expense.empty:
+        st.info("Tanggal transaksi pengeluaran belum valid.")
+        return
+
+    expense["BulanSort"] = expense["date_dt"].dt.to_period("M").dt.to_timestamp()
+    month_lookup = (
+        expense[["BulanSort"]]
+        .drop_duplicates()
+        .sort_values("BulanSort")
+        .assign(Bulan=lambda x: x["BulanSort"].dt.to_period("M").astype(str).map(format_month_id))
+    )
+    month_options = month_lookup["Bulan"].tolist()
+    month_map = dict(zip(month_lookup["Bulan"], month_lookup["BulanSort"]))
+
+    min_d = expense["date_dt"].min().date()
+    max_d = expense["date_dt"].max().date()
+    with st.expander("Filter", expanded=True):
+        st.caption("Pakai filter bulan kalau mau lihat belanja bulan tertentu, misalnya hanya Mei 2026.")
+        selected_months = st.multiselect(
+            "Bulan belanja",
+            ["Semua"] + month_options,
+            default=["Semua"],
+            key="mov_months",
+        )
+        c1, c2 = st.columns(2)
+        start = c1.date_input("Tanggal awal", value=min_d, format="DD/MM/YYYY", key="mov_start")
+        end = c2.date_input("Tanggal akhir", value=max_d, format="DD/MM/YYYY", key="mov_end")
+        cats = st.multiselect("Kategori", ["Semua"] + get_categories(df), default=["Semua"], key="mov_cats")
+        funds = st.multiselect("Sumber Dana", ["Semua"] + get_funds(df), default=["Semua"], key="mov_funds")
+        chart_type = st.radio("Jenis grafik", ["Line chart", "Bar chart"], horizontal=True)
+
+    filtered = filter_transactions(expense.drop(columns=["date_dt", "BulanSort"], errors="ignore"), start, end, funds, ["Keluar"], cats)
+    if selected_months and "Semua" not in selected_months:
+        selected_month_starts = [month_map[m] for m in selected_months if m in month_map]
+        filtered_dt = pd.to_datetime(filtered["date"], errors="coerce")
+        filtered_month = filtered_dt.dt.to_period("M").dt.to_timestamp()
+        filtered = filtered[filtered_month.isin(selected_month_starts)].copy()
+
+    movement = monthly_category_data(filtered, cats, funds)
+    if movement.empty:
+        st.info("Tidak ada data sesuai filter.")
+        return
+
+    selected_month_label = "Semua bulan" if (not selected_months or "Semua" in selected_months) else ", ".join(selected_months)
+    total_filtered = movement["Total"].sum()
+    st.metric("Total belanja sesuai filter", rp_compact(total_filtered), help=rp(total_filtered))
+    st.caption(f"Bulan terpilih: **{selected_month_label}**")
+
+    # Build chart from a real datetime index. Do NOT use the displayed month label
+    # as the index, because Streamlit/Altair can sort text labels
+    # alphabetically.
+    pivot = (
+        movement.groupby(["BulanSort", "Kategori"], as_index=False)["Total"]
+        .sum()
+        .pivot(index="BulanSort", columns="Kategori", values="Total")
+        .fillna(0)
+        .sort_index()
+    )
+
     if chart_type == "Line chart":
         st.line_chart(pivot)
     else:
         st.bar_chart(pivot)
 
-    st.subheader("Tabel Belanja Bulanan per Kategori")
-    table = pivot.copy()
-    table["Total"] = table.sum(axis=1)
-    table_display = table.reset_index().copy()
-    for col in table_display.columns:
-        if col != "Bulan":
-            table_display[col] = table_display[col].apply(compact_rp)
-    display_df(table_display)
+    st.subheader("Tabel Pivot Bulan x Kategori")
+    pivot_disp = pivot.reset_index().rename(columns={"BulanSort": "Bulan"})
+    pivot_disp["Bulan"] = pivot_disp["Bulan"].dt.to_period("M").astype(str).map(format_month_id)
+    show_df(df_display(pivot_disp, money_cols=[c for c in pivot_disp.columns if c != "Bulan"]))
 
-    with st.expander("Lihat nominal penuh"):
-        detail_table = table.reset_index().copy()
-        for col in detail_table.columns:
-            if col != "Bulan":
-                detail_table[col] = detail_table[col].apply(full_rp)
-        display_df(detail_table)
+    st.subheader("Ranking Belanja Kategori")
+    rank = movement.groupby("Kategori", as_index=False)["Total"].sum().sort_values("Total", ascending=False)
+    show_df(df_display(rank, money_cols=["Total"]))
 
-    st.subheader("Ranking Kategori Belanja")
-    category_rank = category_total.reset_index()
-    category_rank.columns = ["Kategori", "Nominal"]
-    category_rank["Nominal Ringkas"] = category_rank["Nominal"].apply(compact_rp)
-    category_rank["Porsi"] = category_rank["Nominal"].apply(lambda x: f"{(x / total_spending * 100):.1f}%" if total_spending else "0%")
-    display_df(category_rank[["Kategori", "Nominal Ringkas", "Porsi"]])
+    st.subheader("Detail Transaksi Pengeluaran")
+    detail = filtered.sort_values("date").copy()
+    detail_disp = detail[["date", "fund", "category", "description", "amount", "note"]].rename(columns={
+        "date": "Tanggal",
+        "fund": "Sumber Dana",
+        "category": "Kategori",
+        "description": "Keterangan",
+        "amount": "Keluar",
+        "note": "Catatan",
+    })
+    show_df(df_display(detail_disp, money_cols=["Keluar"], date_cols=["Tanggal"]), height=360)
 
-    with st.expander("Data long format / siap pivot"):
-        long_display = grouped.copy()
-        long_display["Nominal Ringkas"] = long_display["Nominal"].apply(compact_rp)
-        long_display["Nominal Detail"] = long_display["Nominal"].apply(full_rp)
-        display_df(long_display[["Bulan", "Kategori", "Nominal Ringkas", "Nominal Detail"]])
-
-    c1, c2 = st.columns(2)
-    c1.download_button(
-        "Download Pivot CSV",
-        data=to_csv_bytes(table.reset_index()),
-        file_name="pergerakan_belanja_bulanan_pivot.csv",
+    export_movement = movement.copy()
+    export_movement["BulanSort"] = export_movement["BulanSort"].dt.strftime("%Y-%m")
+    st.download_button(
+        "Download data pergerakan CSV",
+        data=export_movement.to_csv(index=False).encode("utf-8"),
+        file_name="pergerakan_belanja_bulanan.csv",
         mime="text/csv",
-        use_container_width=True,
+    )
+
+
+def page_import_export(df, budgets):
+    st.title("⬆️⬇️ Import / Export")
+    st.info(
+        "Sekarang file Excel hasil export bisa langsung jadi template update data berikutnya. "
+        "Download Excel Import-Ready, edit/tambah transaksi di sheet `Master Kas`, lalu upload lagi dengan mode `Replace semua data`."
+    )
+
+    st.subheader("Export")
+    c1, c2, c3 = st.columns(3)
+    c1.download_button(
+        "Download Excel Import-Ready",
+        data=make_excel_bytes(),
+        file_name="padebuolo_import_ready_export.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        help="File ini bisa diedit lalu di-upload kembali sebagai basis data baru.",
     )
     c2.download_button(
-        "Download Long CSV",
-        data=to_csv_bytes(grouped),
-        file_name="pergerakan_belanja_bulanan_long.csv",
+        "Download JSON Backup",
+        data=json.dumps(export_payload(), ensure_ascii=False, indent=2).encode("utf-8"),
+        file_name="padebuolo_backup.json",
+        mime="application/json",
+    )
+    c3.download_button(
+        "Download Transaksi CSV",
+        data=make_master_kas_export().to_csv(index=False).encode("utf-8"),
+        file_name="padebuolo_transaksi_import_ready.csv",
         mime="text/csv",
-        use_container_width=True,
+        help="CSV ini juga memakai kolom Indonesia: Tanggal, Sumber Dana, Masuk, Keluar, dan seterusnya.",
     )
 
-def page_budget(df: pd.DataFrame, budgets: pd.DataFrame) -> None:
-    st.title("🧾 Budget Bulanan")
-    st.caption("Budget bulanan standar: Rayhan 715,000 dan Azka 760,000.")
-
-    total_budget = int(budgets["amount"].sum()) if not budgets.empty else 0
-    saldo = summarize(df)["saldo"]
-    expected_total = sum(amount for _, _, amount in DEFAULT_BUDGETS)
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Budget Bulanan", format_budget_number(total_budget))
-    c2.metric("Saldo Kas", compact_rp(saldo), help=full_rp(saldo))
-    c3.metric("Estimasi Bertahan", f"{saldo / total_budget:.1f} bulan" if total_budget > 0 else "-")
-
-    st.subheader("Rekap Budget per Orang")
-    col_rayhan, col_azka = st.columns(2)
-    with col_rayhan:
-        st.markdown("### Rayhan")
-        display_df(budget_table_for_person(budgets, "Kas Rayhan"), hide_index=True)
-    with col_azka:
-        st.markdown("### Azka")
-        display_df(budget_table_for_person(budgets, "Kas Azka"), hide_index=True)
-
-    if total_budget != expected_total:
-        st.warning(
-            "Budget saat ini belum sama dengan standar. "
-            f"Seharusnya total {format_budget_number(expected_total)}, saat ini {format_budget_number(total_budget)}."
+    with st.expander("Cara update data pakai file export", expanded=False):
+        st.markdown(
+            """
+1. Klik **Download Excel Import-Ready**.  
+2. Buka Excel-nya, edit atau tambah baris transaksi di sheet **Master Kas**.  
+3. Jangan ubah nama sheet **Master Kas** dan **Biaya Bulanan**.  
+4. Pastikan tanggal tetap **DD/MM/YYYY**, contoh `11/04/2026`.  
+5. Upload lagi file itu di bawah ini.  
+6. Pilih **Replace semua data** kalau Excel itu mau jadi database terbaru.  
+            """
         )
-
-    if st.button("Reset ke Budget Standar Padebuolo", type="primary", use_container_width=True):
-        reset_standard_budgets(mark_meta=True)
-        st.success("Budget berhasil direset: Rayhan 715,000 dan Azka 760,000.")
-        st.rerun()
-
-    with st.expander("Edit manual / tambah komponen lain"):
-        st.subheader("Daftar Budget Saat Ini")
-        if budgets.empty:
-            st.info("Belum ada budget.")
-        else:
-            show = budgets.copy()
-            show["Orang"] = show["person"].map(PERSON_LABELS).fillna(show["person"])
-            show["Nominal"] = show["amount"].apply(format_budget_number)
-            display_df(show[["id", "Orang", "component", "Nominal"]].rename(columns={"component": "Komponen"}))
-
-        st.subheader("Tambah Budget")
-        funds = get_fund_list(df)
-        with st.form("budget_form", clear_on_submit=True):
-            c1, c2, c3 = st.columns([1, 1.5, 1])
-            person = c1.selectbox("Sumber dana/orang", funds)
-            component = c2.text_input("Komponen", placeholder="Sewa, listrik, internet, air, dll")
-            amount = c3.number_input("Nominal", min_value=0, step=10_000, format="%d")
-            submitted = st.form_submit_button("Tambah Budget", type="primary")
-        if submitted:
-            if not component.strip() or amount <= 0:
-                st.error("Komponen dan nominal wajib diisi.")
-            else:
-                add_budget(person, component.strip(), int(amount))
-                st.success("Budget ditambahkan.")
-                st.rerun()
-
-        if not budgets.empty:
-            st.subheader("Hapus Budget")
-            selected = st.selectbox("Pilih budget", budgets["id"].astype(int).tolist(), format_func=lambda x: f"ID {x}")
-            if st.button("Hapus Budget Terpilih"):
-                delete_budget(int(selected))
-                st.warning("Budget dihapus.")
-                st.rerun()
-
-
-def page_import_export(df: pd.DataFrame, budgets: pd.DataFrame) -> None:
-    st.title("📦 Import / Export")
-    st.subheader("Export")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.download_button("Backup JSON", data=backup_json_bytes(), file_name="backup_kas_rumdin.json", mime="application/json", use_container_width=True)
-    c2.download_button("Buku Besar CSV", data=to_csv_bytes(detail_ledger_view(df)), file_name="buku_besar_kas_rumdin.csv", mime="text/csv", use_container_width=True)
-    c3.download_button("Export Excel", data=export_excel_bytes(), file_name="rekap_kas_rumdin.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-    if DB_PATH.exists():
-        c4.download_button("Download DB", data=DB_PATH.read_bytes(), file_name="kas_rumdin.db", mime="application/octet-stream", use_container_width=True)
 
     st.divider()
     st.subheader("Import")
-    st.caption("Bisa import backup JSON dari app ini, CSV transaksi, atau Excel lama dengan sheet Master Kas/Biaya Bulanan.")
-    uploaded = st.file_uploader("Upload file", type=["json", "csv", "xlsx", "xls"])
-    replace = st.toggle("Replace semua data saat import", value=False, help="Kalau aktif, transaksi dan budget lama akan dihapus dulu.")
-    if uploaded is not None:
-        tx_rows: List[Dict[str, Any]] = []
-        budget_rows: List[Dict[str, Any]] = []
-        try:
-            if uploaded.name.lower().endswith(".json"):
-                payload = json.loads(uploaded.getvalue().decode("utf-8"))
-                tx_rows = payload.get("transactions", [])
-                budget_rows = payload.get("budgets", [])
-            elif uploaded.name.lower().endswith(".csv"):
-                imported_df = pd.read_csv(uploaded)
-                tx_rows = normalize_transactions_from_df(imported_df)
-            else:
-                xl = pd.ExcelFile(uploaded)
-                tx_sheet = None
-                budget_sheet = None
-                for sheet in xl.sheet_names:
-                    low = sheet.lower()
-                    if tx_sheet is None and ("trans" in low or "master" in low or "buku" in low):
-                        tx_sheet = sheet
-                    if budget_sheet is None and ("budget" in low or "biaya" in low):
-                        budget_sheet = sheet
-                if tx_sheet:
-                    tx_rows = normalize_transactions_from_df(pd.read_excel(xl, sheet_name=tx_sheet))
-                if budget_sheet:
-                    budget_rows = normalize_budgets_from_df(pd.read_excel(xl, sheet_name=budget_sheet))
-            st.info(f"Terdeteksi {len(tx_rows)} transaksi dan {len(budget_rows)} budget.")
-            with st.expander("Preview transaksi import"):
-                display_df(pd.DataFrame(tx_rows).head(20))
-            if st.button("Proses Import", type="primary"):
-                tx_count, bd_count = import_rows(tx_rows, budget_rows, replace=replace)
-                st.success(f"Import selesai: {tx_count} transaksi dan {bd_count} budget masuk.")
+    st.warning("Gunakan Replace kalau file Excel/CSV yang di-upload adalah basis data terbaru. Gunakan Append kalau cuma nambah transaksi baru.")
+    upload = st.file_uploader("Upload Excel / CSV / JSON", type=["xlsx", "csv", "json"])
+    mode = st.radio("Mode import", ["Replace semua data", "Append transaksi"], horizontal=True)
+    if upload is not None:
+        if st.button("Proses Import"):
+            try:
+                name = upload.name.lower()
+                replace = mode.startswith("Replace")
+                if name.endswith(".json"):
+                    payload = json.loads(upload.getvalue().decode("utf-8"))
+                    import_payload(payload, replace=replace)
+                elif name.endswith(".csv"):
+                    tmp = pd.read_csv(upload)
+                    if replace:
+                        replace_transactions(tmp)
+                    else:
+                        append_transactions(tmp)
+                elif name.endswith(".xlsx"):
+                    tx, bud = parse_excel_to_dataframes(upload)
+                    if replace:
+                        replace_transactions(tx)
+                        replace_budgets(bud if not bud.empty else pd.DataFrame(BUDGET_STANDARD))
+                    else:
+                        append_transactions(tx)
+                cloud_auto_backup()
+                st.success("Import berhasil. Data terbaru sudah masuk ke aplikasi.")
                 st.rerun()
-        except Exception as exc:
-            st.error(f"Gagal membaca file: {exc}")
+            except Exception as e:
+                st.error(f"Import gagal: {type(e).__name__}: {e}")
+
+def page_pengaturan():
+    st.title("⚙️ Pengaturan")
+    st.subheader("Penyimpanan")
+    st.code(str(DB_PATH))
+    st.write(f"Jumlah transaksi: **{table_count('transactions')}**")
+    st.write(f"Jumlah budget: **{table_count('budgets')}**")
+    st.write(f"Last cloud backup: `{get_meta('last_cloud_backup_at', '-')}`")
+    st.write(f"Last cloud restore: `{get_meta('last_cloud_restore_at', '-')}`")
+    err = get_meta("last_cloud_backup_error", "")
+    if err:
+        st.warning(f"Last backup error: {err}")
+
+    st.subheader("Cloud Persistence")
+    if is_github_enabled():
+        st.success("GitHub backup aktif.")
+        st.caption(f"Repo data: `{github_config()['repo']}` | File: `{github_config()['path']}`")
+    else:
+        st.warning("GitHub backup belum aktif. Data di Streamlit Cloud bisa hilang setelah reboot/redeploy kalau tidak dikonfigurasi.")
+        with st.expander("Template Secrets"):
+            st.code("""
+APP_PASSWORD = "ganti_password_app"
+PERSISTENCE_PROVIDER = "github"
+GITHUB_TOKEN = "github_pat_xxx"
+GITHUB_REPO = "username/padebuolo-data"
+GITHUB_BRANCH = "main"
+GITHUB_DATA_FILE = "padebuolo_live_backup.json"
+""".strip(), language="toml")
+            st.caption("Saran: pakai repo data terpisah dan private supaya backup tidak memicu redeploy app.")
+
+    c1, c2 = st.columns(2)
+    if c1.button("Simpan backup cloud sekarang"):
+        ok, msg = cloud_backup_now()
+        if ok:
+            st.success(msg)
+        else:
+            st.error(msg)
+    if c2.button("Pulihkan dari backup cloud"):
+        ok, msg = cloud_restore_now()
+        if ok:
+            st.success(msg)
+            st.rerun()
+        else:
+            st.error(msg)
 
     st.divider()
-    st.subheader("Reset Data dari File GitHub")
-    st.warning("Reset akan menghapus semua transaksi dan budget aktif, lalu mengisi ulang dari data/seed_transactions.csv dan data/seed_budgets.csv di GitHub.")
-    confirm = st.text_input("Ketik RESET untuk konfirmasi")
-    if st.button("Reset ke Data Import Ready"):
-        if confirm == "RESET":
-            try:
-                tx_count, bd_count = reset_db_from_seed_files()
-                st.success(f"Data berhasil direset: {tx_count} transaksi dan {bd_count} budget masuk.")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Reset gagal: {exc}")
-        else:
-            st.error("Konfirmasi belum sesuai.")
+    st.subheader("Reset Database")
+    st.warning("Reset akan mengganti database lokal dari file seed di folder data.")
+    confirm_seed = st.checkbox("Saya paham, reset database dari file seed GitHub", key="confirm_seed")
+    if st.button("Reset Database dari File Seed", disabled=not confirm_seed):
+        seed_from_files(force=True)
+        cloud_auto_backup()
+        st.success("Database direset dari file seed.")
+        st.rerun()
 
-
-
-def page_bulk_category(df: pd.DataFrame) -> None:
-    st.title("🧠 Kategorisasi Massal")
-    st.caption("Pakai menu ini kalau banyak transaksi masih kebaca sebagai Lainnya. Sistem akan membaca kata kunci dari keterangan/catatan transaksi.")
-    if df.empty:
-        st.info("Belum ada transaksi.")
-        return
-
-    total_lainnya = int((df["category"] == "Lainnya").sum()) if "category" in df.columns else 0
-    total_rows = len(df)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Transaksi", f"{total_rows}")
-    c2.metric("Masih Lainnya", f"{total_lainnya}")
-    c3.metric("Proporsi Lainnya", f"{(total_lainnya / total_rows * 100):.1f}%" if total_rows else "0%")
-
-    st.subheader("1) Auto-kategorisasi dari keyword")
-    only_lainnya_auto = st.toggle("Hanya ubah transaksi yang kategorinya masih Lainnya", value=True, key="auto_only_lainnya")
-    preview = df.copy()
-    if only_lainnya_auto:
-        preview = preview[preview["category"] == "Lainnya"]
-    preview["Kategori Usulan"] = preview.apply(lambda r: infer_category(r.get("description", ""), r.get("note", ""), str(r.get("type", "Keluar"))), axis=1)
-    preview = preview[preview["Kategori Usulan"] != preview["category"]]
-
-    st.write(f"Transaksi yang akan berubah kalau tombol diterapkan: **{len(preview)}**")
-    if not preview.empty:
-        show = preview.copy().head(50)
-        show["Tanggal"] = show["date"].apply(format_date_id)
-        show["Nominal"] = show["amount"].apply(compact_rp)
-        display_df(show[["id", "Tanggal", "fund", "type", "Nominal", "category", "Kategori Usulan", "description"]].rename(columns={"fund": "Sumber Dana", "type": "Jenis", "category": "Kategori Lama", "description": "Keterangan"}))
-    else:
-        st.info("Belum ada transaksi yang cocok dengan keyword default.")
-
-    if st.button("Terapkan Auto-kategorisasi", type="primary"):
-        changed = recategorize_by_rules(only_lainnya=only_lainnya_auto)
-        st.success(f"Berhasil mengubah {changed} transaksi.")
+    st.subheader("Hapus Semua Data")
+    confirm_clear = st.checkbox("Saya paham, hapus semua transaksi dan budget", key="confirm_clear_all")
+    if st.button("Hapus Semua Data", disabled=not confirm_clear):
+        with get_conn() as conn:
+            conn.execute("DELETE FROM transactions")
+            conn.execute("DELETE FROM budgets")
+            conn.commit()
+        cloud_auto_backup()
+        st.success("Semua data dihapus.")
         st.rerun()
 
     st.divider()
-    st.subheader("2) Ubah massal berdasarkan kata kunci sendiri")
-    st.caption("Contoh: isi keyword `wifi, internet, indihome`, pilih kategori Internet, lalu terapkan.")
-    with st.form("manual_keyword_category"):
-        c1, c2 = st.columns([2, 1])
-        keywords_text = c1.text_input("Keyword keterangan/catatan", placeholder="wifi, internet, laundry, galon")
-        new_category = c2.selectbox("Ubah jadi kategori", CATEGORIES, index=CATEGORIES.index("Lainnya"))
-        only_lainnya_manual = st.checkbox("Hanya ubah yang masih Lainnya", value=True)
-        submitted = st.form_submit_button("Terapkan Keyword Ini", type="primary")
-    if submitted:
-        keywords = [x.strip() for x in keywords_text.split(",") if x.strip()]
-        if not keywords:
-            st.error("Isi minimal satu keyword.")
-        elif new_category == "Lainnya":
-            st.error("Pilih kategori selain Lainnya supaya ada perubahan.")
-        else:
-            changed = recategorize_by_keyword(keywords, new_category, only_lainnya=only_lainnya_manual)
-            st.success(f"Berhasil mengubah {changed} transaksi menjadi {new_category}.")
-            st.rerun()
-
-    st.divider()
-    st.subheader("Daftar keyword default")
-    rules_rows = []
-    for category, keywords in CATEGORY_RULES.items():
-        rules_rows.append({"Kategori": category, "Keyword": ", ".join(keywords)})
-    display_df(pd.DataFrame(rules_rows))
+    st.caption(APP_VERSION)
 
 
-def page_settings(df: pd.DataFrame) -> None:
-    st.title("⚙️ Pengaturan & Info Deploy")
-    st.write("Lokasi database aktif:")
-    st.code(str(DB_PATH))
-    st.write("Sumber dana aktif:")
-    st.markdown(" ".join(f"<span class='pill'>{fund}</span>" for fund in get_fund_list(df)), unsafe_allow_html=True)
-    st.info("Untuk tambah sumber dana baru, cukup input transaksi dengan nama sumber dana baru di halaman Buku Besar > edit, atau import file dengan sumber dana tersebut.")
-
-    st.subheader("Sinkron Tanggal dari Excel Awal")
-    st.caption("Ini sumber truth-nya dari file data/seed_transactions.csv atau data/Rekap Kas Rumdin.xlsx. Cocok buat kasus data lama terlanjur kebaca 04/11/2026 padahal harusnya 11/04/2026. Transaksi tambahan yang tidak ada di Excel awal tidak disentuh.")
-    seed_candidates = seed_date_repair_candidates(df)
-    if seed_candidates.empty:
-        st.success("Tanggal transaksi yang cocok dengan Excel awal sudah sinkron.")
-    else:
-        st.warning(f"Ada {len(seed_candidates)} transaksi yang tanggalnya beda dari Excel awal. Preview dulu sebelum diperbaiki.")
-        preview_seed = seed_candidates.copy()
-        preview_seed["Nominal"] = preview_seed["Nominal"].apply(compact_rp)
-        display_df(preview_seed[["id", "Tanggal Lama", "Tanggal Seharusnya", "Sumber Dana", "Jenis", "Kategori", "Keterangan", "Nominal"]])
-        confirm_seed = st.checkbox("Saya mau paksa tanggal ikut Excel awal", key="confirm_seed_date_repair")
-        if st.button("Sinkronkan Tanggal dari Excel Awal", type="primary", disabled=not confirm_seed):
-            changed = apply_seed_date_repair(seed_candidates)
-            st.success(f"Berhasil menyinkronkan {changed} tanggal dari Excel awal.")
-            st.rerun()
-
-    st.divider()
-    st.subheader("Perbaikan Tanggal Ketuker")
-    st.caption("Pakai ini sekali saja kalau data lama terlanjur kebaca MM/DD/YYYY. Contoh salah: 11/04/2026 tampil sebagai 04/11/2026. Perbaikan akan mengubah 2026-11-04 menjadi 2026-04-11.")
-    if df.empty:
-        st.info("Belum ada transaksi untuk dicek.")
-    else:
-        inferred_month = infer_swapped_source_month(df)
-        months = list(range(1, 13))
-        default_index = months.index(inferred_month) if inferred_month in months else int(date.today().month) - 1
-        correct_month = st.selectbox(
-            "Bulan yang benar untuk data yang ketuker",
-            months,
-            index=default_index,
-            format_func=lambda x: f"{x:02d} - {MONTH_NAMES_ID[x]}",
-            help="Kalau contoh lo 11/4/2026 harusnya 11 April 2026, pilih 04 - April.",
-        )
-        candidates = swapped_date_candidates(df, int(correct_month))
-        if candidates.empty:
-            st.success("Tidak ada kandidat tanggal ketuker untuk bulan ini.")
-        else:
-            st.warning(f"Ditemukan {len(candidates)} kandidat tanggal yang kemungkinan ketuker. Cek preview dulu sebelum klik perbaiki.")
-            preview = candidates.copy()
-            preview["Nominal"] = preview["Nominal"].apply(compact_rp)
-            display_df(preview[["id", "Tanggal Lama", "Tanggal Baru", "Sumber Dana", "Jenis", "Kategori", "Keterangan", "Nominal"]])
-            with st.expander("Detail ISO yang akan diubah"):
-                display_df(candidates[["id", "date_lama_iso", "date_baru_iso", "Keterangan"]])
-            confirm = st.checkbox("Saya sudah cek preview dan ingin memperbaiki tanggal di atas")
-            if st.button("Perbaiki tanggal ketuker", type="primary", disabled=not confirm):
-                changed = apply_swapped_date_fix(candidates)
-                st.success(f"Berhasil memperbaiki {changed} tanggal.")
-                st.rerun()
-
-    st.divider()
-    st.subheader("Upload Ulang Data dari File GitHub")
-    st.caption("Pakai ini setelah lo replace file data/seed_transactions.csv dan data/seed_budgets.csv di GitHub. Ini akan mengganti database aktif dengan file import-ready tersebut.")
-    seed_tx = DATA_DIR / "seed_transactions.csv"
-    seed_bd = DATA_DIR / "seed_budgets.csv"
-    st.write("File seed transaksi:")
-    st.code(str(seed_tx))
-    st.write("File seed budget:")
-    st.code(str(seed_bd))
-    confirm_seed_reset = st.checkbox("Saya paham: database aktif akan diganti total dari file seed GitHub", key="confirm_seed_reset_v57")
-    if st.button("Reset Database dari File Seed GitHub", type="primary", disabled=not confirm_seed_reset):
-        try:
-            tx_count, bd_count = reset_db_from_seed_files()
-            st.success(f"Berhasil reset dari seed: {tx_count} transaksi dan {bd_count} budget.")
-            st.rerun()
-        except Exception as exc:
-            st.error(f"Reset dari seed gagal: {exc}")
-
-    st.divider()
-    st.subheader("Penyimpanan Permanen")
-    if cloud_sync_enabled():
-        cfg = cloud_sync_config()
-        st.success("Cloud backup aktif. Setiap perubahan akan disimpan ke GitHub JSON backup.")
-        st.write("Lokasi backup cloud:")
-        st.code(f"{cfg['repo']} / {cfg['branch']} / {cfg['path']}")
-        if st.session_state.get("cloud_sync_last_status"):
-            st.info(st.session_state.get("cloud_sync_last_status"))
-        if st.session_state.get("cloud_sync_last_error"):
-            st.warning(st.session_state.get("cloud_sync_last_error"))
-        c1, c2 = st.columns(2)
-        if c1.button("Simpan backup cloud sekarang", use_container_width=True):
-            ok = sync_local_db_to_github(reason="manual_backup")
-            if ok:
-                st.success("Backup cloud berhasil disimpan.")
-            else:
-                st.error(st.session_state.get("cloud_sync_last_error", "Backup cloud gagal."))
-        if c2.button("Pulihkan dari backup cloud", use_container_width=True):
-            snapshot = load_snapshot_from_github()
-            if snapshot:
-                tx_count, bd_count = replace_local_db_from_snapshot(snapshot)
-                st.success(f"Berhasil pulihkan {tx_count} transaksi dan {bd_count} budget dari cloud.")
-                st.rerun()
-            else:
-                st.warning("Backup cloud belum ditemukan.")
-    else:
-        st.warning("Cloud backup belum aktif. Kalau Streamlit reboot/idle, perubahan di SQLite lokal bisa hilang.")
-        st.markdown(
-            """
-            Isi **Streamlit Secrets** seperti ini agar data tetap aman setelah reboot:
-
-            ```toml
-            APP_PASSWORD = "password-app-lo"
-            PERSISTENCE_PROVIDER = "github"
-            GITHUB_TOKEN = "github_pat_xxx"
-            GITHUB_REPO = "username/padebuolo-data"
-            GITHUB_BRANCH = "main"
-            GITHUB_DATA_FILE = "padebuolo_live_backup.json"
-            ```
-
-            Saran: pakai repo data terpisah/private, misalnya `padebuolo-data`, supaya backup data tidak memicu redeploy app.
-            """
-        )
-
-    st.caption("SQLite tetap dipakai sebagai database kerja cepat di runtime. GitHub JSON backup dipakai untuk restore otomatis saat local DB kosong setelah reboot.")
-
-
-def main() -> None:
-    init_db()
-    if not render_login():
+def main():
+    st.set_page_config(page_title=APP_TITLE, page_icon="🏠", layout="wide")
+    first_boot_restore_or_seed()
+    if not require_login():
         return
 
-    df = fetch_transactions()
-    budgets = fetch_budgets()
+    df = read_transactions()
+    budgets = read_budgets()
 
-    st.sidebar.title("🏠 V.4 Padebuolo Next")
-    page = st.sidebar.radio(
+    st.sidebar.title("🏠 Padebuolo")
+    st.sidebar.caption(APP_VERSION)
+    menu = st.sidebar.radio(
         "Menu",
-        ["Dashboard", "Input Transaksi", "Buku Besar", "Pergerakan Belanja", "Kategorisasi Massal", "Budget Bulanan", "Import / Export", "Pengaturan"],
+        [
+            "Dashboard",
+            "Input Transaksi",
+            "Buku Besar",
+            "Kategorisasi Massal",
+            "Budget Bulanan",
+            "Pergerakan Belanja",
+            "Import / Export",
+            "Pengaturan",
+        ],
     )
     st.sidebar.divider()
-    st.sidebar.caption(f"{APP_VERSION}")
+    if is_github_enabled():
+        st.sidebar.success("Cloud backup aktif")
+    else:
+        st.sidebar.warning("Cloud backup belum aktif")
+    st.sidebar.caption(f"Default password: {DEFAULT_PASSWORD}")
     if st.sidebar.button("Logout"):
-        st.session_state.pop("authenticated", None)
+        st.session_state.logged_in = False
         st.rerun()
 
-    if page == "Dashboard":
+    if menu == "Dashboard":
         page_dashboard(df, budgets)
-    elif page == "Input Transaksi":
+    elif menu == "Input Transaksi":
         page_input(df)
-    elif page == "Buku Besar":
-        page_ledger(df)
-    elif page == "Pergerakan Belanja":
-        page_monthly_category(df)
-    elif page == "Kategorisasi Massal":
-        page_bulk_category(df)
-    elif page == "Budget Bulanan":
+    elif menu == "Buku Besar":
+        page_buku_besar(df)
+    elif menu == "Kategorisasi Massal":
+        page_kategorisasi(df)
+    elif menu == "Budget Bulanan":
         page_budget(df, budgets)
-    elif page == "Import / Export":
+    elif menu == "Pergerakan Belanja":
+        page_pergerakan(df)
+    elif menu == "Import / Export":
         page_import_export(df, budgets)
-    else:
-        page_settings(df)
+    elif menu == "Pengaturan":
+        page_pengaturan()
 
 
 if __name__ == "__main__":
