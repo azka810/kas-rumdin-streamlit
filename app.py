@@ -13,7 +13,7 @@ import requests
 import streamlit as st
 
 APP_TITLE = "V.6 Padebuolo Fresh"
-APP_VERSION = "V.6.8 Fresh - Export Import Fix Final + Auto Cloud Sync"
+APP_VERSION = "V.6.8 Beyond Super!!!!!"
 DEFAULT_PASSWORD = "rumdin123"
 
 BASE_DIR = Path(__file__).resolve().parent
