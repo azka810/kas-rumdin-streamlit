@@ -13,7 +13,8 @@ import requests
 import streamlit as st
 
 APP_TITLE = "V.6 Padebuolo Fresh"
-APP_VERSION = "V.6.4 Fresh - Beyond ssssuuuuper!!!!"
+APP_VERSION = "Beyonddddd SUUUPEEERRRR!!!!"
+DEFAULT_PASSWORD = "rumdin123"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -297,6 +298,40 @@ def set_meta(key, value):
         conn.commit()
 
 
+def now_iso():
+    return datetime.utcnow().isoformat(timespec="seconds")
+
+
+def parse_meta_datetime(value):
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "").replace("+00:00", ""))
+    except Exception:
+        try:
+            return pd.to_datetime(value, errors="coerce").to_pydatetime()
+        except Exception:
+            return None
+
+
+def payload_data_timestamp(payload):
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("data_updated_at") or payload.get("exported_at") or payload.get("updated_at")
+    return parse_meta_datetime(value)
+
+
+def local_data_timestamp():
+    return parse_meta_datetime(get_meta("local_data_updated_at"))
+
+
+def mark_data_changed(reason="manual"):
+    ts = now_iso()
+    set_meta("local_data_updated_at", ts)
+    set_meta("last_change_reason", reason)
+    return ts
+
+
 def read_transactions():
     with get_conn() as conn:
         df = pd.read_sql_query("SELECT * FROM transactions ORDER BY date, id", conn)
@@ -456,9 +491,9 @@ def normalize_budgets_for_db(df):
     return pd.DataFrame(rows, columns=columns) if rows else pd.DataFrame(BUDGET_STANDARD)
 
 
-def replace_transactions(df):
+def replace_transactions(df, mark_change=True, reason="replace_transactions"):
     df = canonicalize_transactions_for_db(df)
-    now = datetime.utcnow().isoformat(timespec="seconds")
+    now = now_iso()
     rows = []
     for _, r in df.iterrows():
         rows.append((
@@ -480,11 +515,34 @@ def replace_transactions(df):
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, rows)
         conn.commit()
+    if mark_change:
+        mark_data_changed(reason)
 
 
-def append_transactions(df):
+def replace_budgets(df, mark_change=True, reason="replace_budgets"):
+    df = normalize_budgets_for_db(df)
+    rows = []
+    for _, r in df.iterrows():
+        rows.append((
+            normalize_text(r.get("fund") or "Kas Azka"),
+            normalize_text(r.get("component") or r.get("komponen") or ""),
+            parse_number(r.get("amount") if "amount" in r else r.get("total"), 0),
+            normalize_text(r.get("note") or r.get("catatan") or ""),
+        ))
+    with get_conn() as conn:
+        conn.execute("DELETE FROM budgets")
+        conn.executemany("INSERT INTO budgets(fund, component, amount, note) VALUES (?, ?, ?, ?)", rows)
+        conn.commit()
+    if mark_change:
+        mark_data_changed(reason)
+
+
+def reset_standard_budget(mark_change=True):
+    replace_budgets(pd.DataFrame(BUDGET_STANDARD), mark_change=mark_change, reason="reset_standard_budget")
+
+def append_transactions(df, mark_change=True, reason="append_transactions"):
     df = canonicalize_transactions_for_db(df)
-    now = datetime.utcnow().isoformat(timespec="seconds")
+    now = now_iso()
     rows = []
     for _, r in df.iterrows():
         rows.append((
@@ -505,20 +563,22 @@ def append_transactions(df):
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, rows)
         conn.commit()
+    if mark_change:
+        mark_data_changed(reason)
 
 def add_transaction(date_value, fund, trx_type, amount, category, description, method="Kas", note=""):
-    now = datetime.utcnow().isoformat(timespec="seconds")
+    now = now_iso()
     with get_conn() as conn:
         conn.execute("""
             INSERT INTO transactions(date, fund, type, amount, category, description, method, note, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (parse_date_any(date_value), fund, trx_type, parse_number(amount), category, description, method, note, now, now))
         conn.commit()
+    mark_data_changed("add_transaction")
     cloud_auto_backup()
 
-
 def update_transaction(trx_id, date_value, fund, trx_type, amount, category, description, method, note):
-    now = datetime.utcnow().isoformat(timespec="seconds")
+    now = now_iso()
     with get_conn() as conn:
         conn.execute("""
             UPDATE transactions
@@ -526,92 +586,203 @@ def update_transaction(trx_id, date_value, fund, trx_type, amount, category, des
             WHERE id=?
         """, (parse_date_any(date_value), fund, trx_type, parse_number(amount), category, description, method, note, now, int(trx_id)))
         conn.commit()
+    mark_data_changed("update_transaction")
     cloud_auto_backup()
-
 
 def delete_transaction(trx_id):
     with get_conn() as conn:
         conn.execute("DELETE FROM transactions WHERE id=?", (int(trx_id),))
         conn.commit()
+    mark_data_changed("delete_transaction")
     cloud_auto_backup()
-
 
 def add_budget(fund, component, amount, note=""):
     with get_conn() as conn:
         conn.execute("INSERT INTO budgets(fund, component, amount, note) VALUES (?, ?, ?, ?)", (fund, component, parse_number(amount), note))
         conn.commit()
+    mark_data_changed("add_budget")
     cloud_auto_backup()
-
 
 def update_budget(budget_id, fund, component, amount, note=""):
     with get_conn() as conn:
         conn.execute("UPDATE budgets SET fund=?, component=?, amount=?, note=? WHERE id=?", (fund, component, parse_number(amount), note, int(budget_id)))
         conn.commit()
+    mark_data_changed("update_budget")
     cloud_auto_backup()
-
 
 def delete_budget(budget_id):
     with get_conn() as conn:
         conn.execute("DELETE FROM budgets WHERE id=?", (int(budget_id),))
         conn.commit()
+    mark_data_changed("delete_budget")
     cloud_auto_backup()
 
-
-def seed_from_files(force=False):
+def seed_from_files(force=False, mark_change=True):
     if force or table_count("transactions") == 0:
         if SEED_TX_PATH.exists():
             tx = pd.read_csv(SEED_TX_PATH)
-            replace_transactions(tx)
+            replace_transactions(tx, mark_change=False)
         elif SEED_XLSX_PATH.exists():
             tx, bud = parse_excel_to_dataframes(SEED_XLSX_PATH)
-            replace_transactions(tx)
+            replace_transactions(tx, mark_change=False)
             if table_count("budgets") == 0:
-                replace_budgets(bud)
+                replace_budgets(bud, mark_change=False)
     if force or table_count("budgets") == 0:
         if SEED_BUDGET_PATH.exists():
-            replace_budgets(pd.read_csv(SEED_BUDGET_PATH))
+            replace_budgets(pd.read_csv(SEED_BUDGET_PATH), mark_change=False)
         else:
-            reset_standard_budget()
-    set_meta("last_seed_at", datetime.utcnow().isoformat(timespec="seconds"))
-
+            reset_standard_budget(mark_change=False)
+    set_meta("last_seed_at", now_iso())
+    if mark_change:
+        mark_data_changed("seed_from_files")
 
 # ----------------------
 # Import / Export / Persistence
 # ----------------------
+def excel_bytes_io(file):
+    """Return a fresh BytesIO for Excel imports so pandas can read sheets repeatedly."""
+    if hasattr(file, "getvalue"):
+        return io.BytesIO(file.getvalue())
+    if isinstance(file, (str, Path)):
+        return io.BytesIO(Path(file).read_bytes())
+    try:
+        pos = file.tell()
+        data = file.read()
+        file.seek(pos)
+        return io.BytesIO(data)
+    except Exception:
+        return file
+
+
+def clean_key(value):
+    """Normalize column/sheet names for forgiving matching."""
+    return "".join(ch for ch in str(value or "").strip().lower() if ch.isalnum())
+
+
+def read_excel_sheet(file, sheet_name):
+    return pd.read_excel(excel_bytes_io(file), sheet_name=sheet_name)
+
+
+def sheet_score_as_transactions(df):
+    """Score how likely a sheet is an importable transaction sheet."""
+    if df is None or df.empty:
+        return 0
+    keys = {clean_key(c) for c in df.columns}
+    score = 0
+    if {"tanggal", "date"} & keys:
+        score += 3
+    if {"sumberdana", "fund"} & keys:
+        score += 2
+    if {"keterangan", "description", "uraian"} & keys:
+        score += 2
+    if {"masuk", "pemasukan"} & keys:
+        score += 2
+    if {"keluar", "pengeluaran"} & keys:
+        score += 2
+    if {"jumlah", "nominal", "amount", "total"} & keys:
+        score += 2
+    if {"kategori", "category"} & keys:
+        score += 1
+    if {"jenis", "type"} & keys:
+        score += 1
+    return score
+
+
+def sheet_score_as_budget(df):
+    if df is None or df.empty:
+        return 0
+    keys = {clean_key(c) for c in df.columns}
+    score = 0
+    if {"sumberdana", "fund"} & keys:
+        score += 2
+    if {"komponen", "component", "item", "kategori"} & keys:
+        score += 2
+    if {"total", "amount", "nominal", "jumlah"} & keys:
+        score += 2
+    return score
+
+
+def find_sheet_by_name(sheets, candidates):
+    lookup = {clean_key(s): s for s in sheets}
+    for candidate in candidates:
+        key = clean_key(candidate)
+        if key in lookup:
+            return lookup[key]
+    return None
+
+
+def choose_transaction_sheet(file, sheets):
+    """Choose the right transaction sheet even if the name is not exactly Master Kas."""
+    preferred = find_sheet_by_name(sheets, [
+        "Master Kas", "Master_Kas", "MasterKas", "Transaksi", "Transactions",
+        "Data Transaksi", "Buku Besar", "Ledger", "Kas", "Master"
+    ])
+    if preferred:
+        return preferred
+
+    # Avoid report-only sheets unless they are the only parseable sheet.
+    report_keys = {clean_key(x) for x in ["Dashboard", "Pergerakan Belanja", "Panduan Import", "Biaya Bulanan", "Budget"]}
+    best_sheet, best_score = None, -1
+    for sheet in sheets:
+        try:
+            preview = read_excel_sheet(file, sheet).head(20)
+            score = sheet_score_as_transactions(preview)
+            if clean_key(sheet) in report_keys:
+                score -= 3
+            if score > best_score:
+                best_sheet, best_score = sheet, score
+        except Exception:
+            continue
+    if best_sheet and best_score >= 4:
+        return best_sheet
+    raise ValueError(
+        "Sheet transaksi tidak ketemu. Export ulang dari tombol 'Download Excel Import-Ready' atau pastikan ada sheet 'Master Kas'. "
+        f"Sheet yang ada: {', '.join(map(str, sheets))}"
+    )
+
+
+def choose_budget_sheet(file, sheets):
+    preferred = find_sheet_by_name(sheets, ["Biaya Bulanan", "Budget", "Budgets", "Anggaran", "Budget Bulanan"])
+    if preferred:
+        return preferred
+    best_sheet, best_score = None, -1
+    for sheet in sheets:
+        try:
+            preview = read_excel_sheet(file, sheet).head(20)
+            score = sheet_score_as_budget(preview)
+            if score > best_score:
+                best_sheet, best_score = sheet, score
+        except Exception:
+            continue
+    return best_sheet if best_score >= 4 else None
+
+
 def parse_excel_to_dataframes(file):
-    """Read Excel from either the import-ready template or older exports.
+    """Read Excel from import-ready exports or older/raw files.
 
-    Supported transaction sheet names:
-    - Master Kas (preferred, import-ready)
-    - Transaksi (older export)
-    - first sheet fallback
-    Supported budget sheet names:
-    - Biaya Bulanan (preferred)
-    - Budget (older export)
+    Robust behavior:
+    - Prefer sheet `Master Kas` when available.
+    - If not available, auto-detect a transaction sheet based on columns.
+    - Never hard-code only `Master Kas`, so exported/edited files with slightly different names still import.
     """
-    xls = pd.ExcelFile(file)
-    sheets = xls.sheet_names
+    xls = pd.ExcelFile(excel_bytes_io(file))
+    sheets = list(xls.sheet_names)
+    if not sheets:
+        raise ValueError("Workbook kosong, tidak ada sheet yang bisa dibaca.")
 
-    tx_sheet = None
-    for candidate in ["Master Kas", "Transaksi", "Transactions"]:
-        if candidate in sheets:
-            tx_sheet = candidate
-            break
-    if tx_sheet is None:
-        tx_sheet = sheets[0]
-
-    master = pd.read_excel(file, sheet_name=tx_sheet)
+    tx_sheet = choose_transaction_sheet(file, sheets)
+    master = read_excel_sheet(file, tx_sheet)
     tx_df = canonicalize_transactions_for_db(master)
+    if tx_df.empty:
+        raise ValueError(
+            f"Sheet '{tx_sheet}' terbaca, tapi tidak ada transaksi valid. Pastikan kolom minimal ada Tanggal, Sumber Dana, Keterangan, Masuk/Keluar."
+        )
 
     bud_df = pd.DataFrame(BUDGET_STANDARD)
-    budget_sheet = None
-    for candidate in ["Biaya Bulanan", "Budget", "Budgets"]:
-        if candidate in sheets:
-            budget_sheet = candidate
-            break
+    budget_sheet = choose_budget_sheet(file, sheets)
     if budget_sheet:
         try:
-            tmp = pd.read_excel(file, sheet_name=budget_sheet)
+            tmp = read_excel_sheet(file, budget_sheet)
             bud_df = normalize_budgets_for_db(tmp)
         except Exception:
             bud_df = pd.DataFrame(BUDGET_STANDARD)
@@ -622,28 +793,30 @@ def export_payload():
     return {
         "app": APP_TITLE,
         "version": APP_VERSION,
-        "exported_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "exported_at": now_iso(),
+        "data_updated_at": get_meta("local_data_updated_at", now_iso()),
         "transactions": read_transactions().to_dict(orient="records"),
         "budgets": read_budgets().to_dict(orient="records"),
     }
 
-
-def import_payload(payload, replace=True):
+def import_payload(payload, replace=True, mark_change=True, source="import"):
     tx = pd.DataFrame(payload.get("transactions", []))
     bud = pd.DataFrame(payload.get("budgets", []))
     if replace:
         if not tx.empty:
-            replace_transactions(tx)
+            replace_transactions(tx, mark_change=False)
         if not bud.empty:
-            replace_budgets(bud)
+            replace_budgets(bud, mark_change=False)
     else:
         if not tx.empty:
-            append_transactions(tx)
+            append_transactions(tx, mark_change=False)
         if not bud.empty:
             current = read_budgets()
-            replace_budgets(pd.concat([current[["fund", "component", "amount", "note"]], bud], ignore_index=True))
-    set_meta("last_import_at", datetime.utcnow().isoformat(timespec="seconds"))
-
+            base = current[["fund", "component", "amount", "note"]] if not current.empty else pd.DataFrame(columns=["fund", "component", "amount", "note"])
+            replace_budgets(pd.concat([base, bud], ignore_index=True), mark_change=False)
+    set_meta("last_import_at", now_iso())
+    if mark_change:
+        mark_data_changed(f"import_payload:{source}")
 
 def make_master_kas_export(tx=None):
     tx = read_transactions() if tx is None else tx.copy()
@@ -819,40 +992,75 @@ def cloud_backup_now():
         return False, f"Backup cloud gagal: {type(e).__name__}: {e}"
 
 
-def cloud_restore_now():
+def cloud_restore_if_remote_newer(force=False):
+    """Restore GitHub backup only when it is newer than the local DB.
+
+    This prevents the old seed database from winning after Streamlit wakes up,
+    while also preventing an older remote backup from overwriting fresh local edits
+    when backup fails.
+    """
     if not is_github_enabled():
         return False, "GitHub backup belum dikonfigurasi di Secrets."
     try:
         payload, _ = github_get_file()
         if not payload:
+            set_meta("last_cloud_restore_status", "Backup cloud belum ada.")
             return False, "File backup belum ada di repo data."
-        import_payload(payload, replace=True)
-        set_meta("last_cloud_restore_at", datetime.utcnow().isoformat(timespec="seconds"))
+
+        remote_dt = payload_data_timestamp(payload)
+        local_dt = local_data_timestamp()
+        local_empty = table_count("transactions") == 0 and table_count("budgets") == 0
+
+        should_restore = bool(force or local_empty)
+        if not should_restore and remote_dt is not None:
+            should_restore = local_dt is None or remote_dt > local_dt
+
+        if not should_restore:
+            set_meta("last_cloud_restore_status", "Skip: database lokal sudah sama/lebih baru dari backup cloud.")
+            return False, "Backup cloud tidak lebih baru dari database lokal. Restore dilewati."
+
+        import_payload(payload, replace=True, mark_change=False, source="cloud_restore")
+        stamp = payload.get("data_updated_at") or payload.get("exported_at") or now_iso()
+        set_meta("local_data_updated_at", stamp)
+        set_meta("last_cloud_restore_at", now_iso())
+        set_meta("last_cloud_restore_status", "Restore otomatis dari backup cloud berhasil.")
         return True, "Restore dari cloud berhasil."
     except Exception as e:
+        set_meta("last_cloud_restore_status", f"Gagal: {type(e).__name__}: {e}")
         return False, f"Restore cloud gagal: {type(e).__name__}: {e}"
 
+
+def cloud_restore_now():
+    return cloud_restore_if_remote_newer(force=True)
 
 def cloud_auto_backup():
     if is_github_enabled():
         try:
             github_put_file(export_payload())
+            set_meta("last_cloud_backup_error", "")
         except Exception as e:
             set_meta("last_cloud_backup_error", f"{type(e).__name__}: {e}")
 
-
 def first_boot_restore_or_seed():
     init_db()
-    if get_meta("bootstrapped") == "1":
-        return
-    if is_github_enabled():
-        ok, msg = cloud_restore_now()
-        if ok and table_count("transactions") > 0:
-            set_meta("bootstrapped", "1")
-            return
-    seed_from_files(force=False)
-    set_meta("bootstrapped", "1")
 
+    # First priority: if GitHub persistence is active, always check whether
+    # the cloud backup is newer. This fixes Streamlit wake-up/reboot cases where
+    # the local SQLite file falls back to the initial seed database.
+    if is_github_enabled():
+        checked_key = "cloud_checked_this_session"
+        if not st.session_state.get(checked_key):
+            cloud_restore_if_remote_newer(force=False)
+            st.session_state[checked_key] = True
+
+    # If no usable local/cloud data exists, fall back to seed files.
+    if table_count("transactions") == 0 or table_count("budgets") == 0:
+        seed_from_files(force=False, mark_change=True)
+        # If cloud persistence is active and backup file did not exist yet,
+        # initialize the cloud backup with the seed database.
+        cloud_auto_backup()
+
+    set_meta("bootstrapped", "1")
 
 # ----------------------
 # Data views
@@ -974,6 +1182,13 @@ def require_login():
 
 def page_dashboard(df, budgets):
     st.title("🏠 Dashboard Padebuolo")
+    st.download_button(
+        "⬇️ Download Excel Dashboard + Master Kas",
+        data=make_excel_bytes(),
+        file_name="padebuolo_dashboard_import_ready.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        help="File ini berisi sheet Master Kas, jadi bisa diedit lalu di-upload balik di menu Import / Export.",
+    )
     balances = balances_by_fund(df)
     total_saldo = balances["saldo"].sum() if not balances.empty else 0
     total_masuk = df.loc[df["type"].eq("Masuk"), "amount"].sum() if not df.empty else 0
@@ -1200,6 +1415,7 @@ def page_kategorisasi(df):
                 for _, r in candidate.iterrows():
                     conn.execute("UPDATE transactions SET category=?, updated_at=? WHERE id=?", (r["Kategori Usulan"], datetime.utcnow().isoformat(timespec="seconds"), int(r["id"])))
                 conn.commit()
+            mark_data_changed("auto_kategorisasi")
             cloud_auto_backup()
             st.success(f"{len(candidate)} transaksi berhasil dikategorikan.")
             st.rerun()
@@ -1227,6 +1443,7 @@ def page_kategorisasi(df):
                 for tid in ids:
                     conn.execute("UPDATE transactions SET category=?, updated_at=? WHERE id=?", (new_cat, datetime.utcnow().isoformat(timespec="seconds"), int(tid)))
                 conn.commit()
+            mark_data_changed("keyword_kategorisasi")
             cloud_auto_backup()
             st.success(f"{len(ids)} transaksi diubah ke kategori {new_cat}.")
             st.rerun()
@@ -1253,7 +1470,7 @@ def page_budget(df, budgets):
     c1, c2 = st.columns(2)
     with c1:
         if st.button("Reset ke Budget Standar Padebuolo"):
-            reset_standard_budget()
+            reset_standard_budget(mark_change=True)
             cloud_auto_backup()
             st.success("Budget direset ke standar Padebuolo.")
             st.rerun()
@@ -1403,8 +1620,9 @@ def page_pergerakan(df):
 def page_import_export(df, budgets):
     st.title("⬆️⬇️ Import / Export")
     st.info(
-        "Sekarang file Excel hasil export bisa langsung jadi template update data berikutnya. "
-        "Download Excel Import-Ready, edit/tambah transaksi di sheet `Master Kas`, lalu upload lagi dengan mode `Replace semua data`."
+        "Sekarang file Excel hasil export bisa langsung jadi basis upload data berikutnya. "
+        "Download Excel Import-Ready, edit/tambah transaksi di sheet `Master Kas`, lalu upload lagi dengan mode `Replace semua data`. "
+        "Kalau sheet `Master Kas` tidak ada, app akan coba deteksi sheet transaksi dari kolomnya."
     )
 
     st.subheader("Export")
@@ -1468,8 +1686,9 @@ def page_import_export(df, budgets):
                         replace_budgets(bud if not bud.empty else pd.DataFrame(BUDGET_STANDARD))
                     else:
                         append_transactions(tx)
+                mark_data_changed("user_import_excel_csv_json")
                 cloud_auto_backup()
-                st.success("Import berhasil. Data terbaru sudah masuk ke aplikasi.")
+                st.success("Import berhasil. Data terbaru sudah masuk ke aplikasi dan otomatis dibackup ke cloud kalau GitHub backup aktif.")
                 st.rerun()
             except Exception as e:
                 st.error(f"Import gagal: {type(e).__name__}: {e}")
@@ -1480,8 +1699,10 @@ def page_pengaturan():
     st.code(str(DB_PATH))
     st.write(f"Jumlah transaksi: **{table_count('transactions')}**")
     st.write(f"Jumlah budget: **{table_count('budgets')}**")
+    st.write(f"Data lokal terakhir berubah: `{get_meta('local_data_updated_at', '-')}`")
     st.write(f"Last cloud backup: `{get_meta('last_cloud_backup_at', '-')}`")
     st.write(f"Last cloud restore: `{get_meta('last_cloud_restore_at', '-')}`")
+    st.write(f"Status auto-restore: `{get_meta('last_cloud_restore_status', '-')}`")
     err = get_meta("last_cloud_backup_error", "")
     if err:
         st.warning(f"Last backup error: {err}")
@@ -1510,7 +1731,7 @@ GITHUB_DATA_FILE = "padebuolo_live_backup.json"
             st.success(msg)
         else:
             st.error(msg)
-    if c2.button("Pulihkan dari backup cloud"):
+    if c2.button("Pulihkan paksa dari backup cloud"):
         ok, msg = cloud_restore_now()
         if ok:
             st.success(msg)
@@ -1518,12 +1739,20 @@ GITHUB_DATA_FILE = "padebuolo_live_backup.json"
         else:
             st.error(msg)
 
+    if st.button("Cek backup cloud terbaru dan auto-restore kalau lebih baru"):
+        ok, msg = cloud_restore_if_remote_newer(force=False)
+        if ok:
+            st.success(msg)
+            st.rerun()
+        else:
+            st.info(msg)
+
     st.divider()
     st.subheader("Reset Database")
     st.warning("Reset akan mengganti database lokal dari file seed di folder data.")
     confirm_seed = st.checkbox("Saya paham, reset database dari file seed GitHub", key="confirm_seed")
     if st.button("Reset Database dari File Seed", disabled=not confirm_seed):
-        seed_from_files(force=True)
+        seed_from_files(force=True, mark_change=True)
         cloud_auto_backup()
         st.success("Database direset dari file seed.")
         st.rerun()
@@ -1535,6 +1764,7 @@ GITHUB_DATA_FILE = "padebuolo_live_backup.json"
             conn.execute("DELETE FROM transactions")
             conn.execute("DELETE FROM budgets")
             conn.commit()
+        mark_data_changed("clear_all_data")
         cloud_auto_backup()
         st.success("Semua data dihapus.")
         st.rerun()
