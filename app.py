@@ -13,7 +13,7 @@ import requests
 import streamlit as st
 
 APP_TITLE = "V.6 Padebuolo Fresh"
-APP_VERSION = "V.6.7 Fresh - Beyonddd Superr CRAAZYYYY!!!!"
+APP_VERSION = "V.6.8 Fresh - Export Import Fix Final + Auto Cloud Sync"
 DEFAULT_PASSWORD = "rumdin123"
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -223,7 +223,14 @@ def safe_toast(msg):
 
 
 def normalize_text(s):
-    return str(s or "").strip()
+    # Keep blank Excel cells as blank; pandas often represents them as NaN.
+    try:
+        if s is None or pd.isna(s):
+            return ""
+    except Exception:
+        if s is None:
+            return ""
+    return str(s).strip()
 
 
 def auto_category(description):
@@ -660,7 +667,14 @@ def clean_key(value):
 
 
 def read_excel_sheet(file, sheet_name):
+    """Read a sheet from a workbook using a fresh in-memory copy each time."""
     return pd.read_excel(excel_bytes_io(file), sheet_name=sheet_name)
+
+
+def workbook_sheet_names(file):
+    """Return worksheet names from an uploaded Excel workbook."""
+    xls = pd.ExcelFile(excel_bytes_io(file))
+    return list(xls.sheet_names)
 
 
 def sheet_score_as_transactions(df):
@@ -670,15 +684,15 @@ def sheet_score_as_transactions(df):
     keys = {clean_key(c) for c in df.columns}
     score = 0
     if {"tanggal", "date"} & keys:
-        score += 3
+        score += 4
     if {"sumberdana", "fund"} & keys:
-        score += 2
+        score += 3
     if {"keterangan", "description", "uraian"} & keys:
         score += 2
     if {"masuk", "pemasukan"} & keys:
-        score += 2
+        score += 3
     if {"keluar", "pengeluaran"} & keys:
-        score += 2
+        score += 3
     if {"jumlah", "nominal", "amount", "total"} & keys:
         score += 2
     if {"kategori", "category"} & keys:
@@ -692,15 +706,21 @@ def sheet_score_as_budget(df):
     if df is None or df.empty:
         return 0
     keys = {clean_key(c) for c in df.columns}
+    has_fund = bool({"sumberdana", "fund"} & keys)
+    has_component = bool({"komponen", "component", "item"} & keys)
+    # Do NOT treat a transaction sheet as a budget sheet. Transaction exports
+    # have Sumber Dana + Kategori but normally do not have Total/Amount budget.
+    has_amount = bool({"total", "amount", "nominal", "jumlah"} & keys)
+    if not (has_fund and has_component and has_amount):
+        return 0
     score = 0
-    if {"sumberdana", "fund"} & keys:
+    if has_fund:
         score += 2
-    if {"komponen", "component", "item", "kategori"} & keys:
+    if has_component:
         score += 2
-    if {"total", "amount", "nominal", "jumlah"} & keys:
+    if has_amount:
         score += 2
     return score
-
 
 def find_sheet_by_name(sheets, candidates):
     lookup = {clean_key(s): s for s in sheets}
@@ -712,7 +732,12 @@ def find_sheet_by_name(sheets, candidates):
 
 
 def choose_transaction_sheet(file, sheets):
-    """Choose the right transaction sheet even if the name is not exactly Master Kas."""
+    """Choose the transaction sheet from any supported workbook.
+
+    IMPORTANT: this function NEVER assumes `Master Kas` exists. It first checks
+    common names, then scores every sheet from its columns. This prevents the
+    old error: Worksheet named 'Master Kas' not found.
+    """
     preferred = find_sheet_by_name(sheets, [
         "Master Kas", "Master_Kas", "MasterKas", "Transaksi", "Transactions",
         "Data Transaksi", "Buku Besar", "Ledger", "Kas", "Master"
@@ -720,12 +745,11 @@ def choose_transaction_sheet(file, sheets):
     if preferred:
         return preferred
 
-    # Avoid report-only sheets unless they are the only parseable sheet.
-    report_keys = {clean_key(x) for x in ["Dashboard", "Pergerakan Belanja", "Panduan Import", "Biaya Bulanan", "Budget"]}
-    best_sheet, best_score = None, -1
+    report_keys = {clean_key(x) for x in ["Dashboard", "Pergerakan Belanja", "Panduan Import", "Biaya Bulanan", "Budget", "Budgets"]}
+    best_sheet, best_score = None, -10
     for sheet in sheets:
         try:
-            preview = read_excel_sheet(file, sheet).head(20)
+            preview = read_excel_sheet(file, sheet).head(50)
             score = sheet_score_as_transactions(preview)
             if clean_key(sheet) in report_keys:
                 score -= 3
@@ -735,9 +759,16 @@ def choose_transaction_sheet(file, sheets):
             continue
     if best_sheet and best_score >= 4:
         return best_sheet
+
+    # Last safe fallback: if the workbook only has one sheet, try it rather than
+    # crashing on a hard-coded sheet name. The canonicalizer will validate rows.
+    if len(sheets) == 1:
+        return sheets[0]
+
     raise ValueError(
-        "Sheet transaksi tidak ketemu. Export ulang dari tombol 'Download Excel Import-Ready / Template Update' atau pastikan ada sheet 'Master Kas'. "
-        f"Sheet yang ada: {', '.join(map(str, sheets))}"
+        "Sheet transaksi tidak ketemu. App ini sudah tidak wajib pakai nama 'Master Kas', "
+        "tapi tetap butuh sheet dengan kolom transaksi seperti Tanggal, Sumber Dana, Masuk/Keluar, Keterangan. "
+        f"Sheet yang terbaca: {', '.join(map(str, sheets))}"
     )
 
 
@@ -748,7 +779,7 @@ def choose_budget_sheet(file, sheets):
     best_sheet, best_score = None, -1
     for sheet in sheets:
         try:
-            preview = read_excel_sheet(file, sheet).head(20)
+            preview = read_excel_sheet(file, sheet).head(50)
             score = sheet_score_as_budget(preview)
             if score > best_score:
                 best_sheet, best_score = sheet, score
@@ -758,15 +789,13 @@ def choose_budget_sheet(file, sheets):
 
 
 def parse_excel_to_dataframes(file):
-    """Read Excel from import-ready exports or older/raw files.
+    """Read Excel from import-ready exports, older exports, or raw files.
 
-    Robust behavior:
-    - Prefer sheet `Master Kas` when available.
-    - If not available, auto-detect a transaction sheet based on columns.
-    - Never hard-code only `Master Kas`, so exported/edited files with slightly different names still import.
+    Supported transaction sheet names include `Master Kas`, `Transaksi`,
+    `Buku Besar`, and any sheet with matching columns. This is intentionally
+    forgiving so that exports from older versions can still be uploaded.
     """
-    xls = pd.ExcelFile(excel_bytes_io(file))
-    sheets = list(xls.sheet_names)
+    sheets = workbook_sheet_names(file)
     if not sheets:
         raise ValueError("Workbook kosong, tidak ada sheet yang bisa dibaca.")
 
@@ -775,7 +804,9 @@ def parse_excel_to_dataframes(file):
     tx_df = canonicalize_transactions_for_db(master)
     if tx_df.empty:
         raise ValueError(
-            f"Sheet '{tx_sheet}' terbaca, tapi tidak ada transaksi valid. Pastikan kolom minimal ada Tanggal, Sumber Dana, Keterangan, Masuk/Keluar."
+            f"Sheet '{tx_sheet}' terbaca, tapi tidak ada transaksi valid. "
+            "Pastikan kolom minimal ada Tanggal, Sumber Dana, Keterangan, dan Masuk/Keluar. "
+            f"Sheet yang terbaca: {', '.join(map(str, sheets))}"
         )
 
     bud_df = pd.DataFrame(BUDGET_STANDARD)
@@ -929,7 +960,17 @@ def make_excel_bytes():
                 ws.set_column(0, 8, 20)
 
     output.seek(0)
-    return output.getvalue()
+    data = output.getvalue()
+    # Sanity check: every downloaded Excel update template MUST have Master Kas.
+    # If this fails, Streamlit will show the export error immediately instead of
+    # giving the user a broken file.
+    try:
+        sheets = pd.ExcelFile(io.BytesIO(data)).sheet_names
+        if "Master Kas" not in sheets:
+            raise ValueError(f"Export template invalid. Sheets: {sheets}")
+    except Exception as e:
+        raise RuntimeError(f"Gagal membuat Excel Import-Ready: {e}")
+    return data
 
 def is_github_enabled():
     provider = str(get_secret("PERSISTENCE_PROVIDER", "") or "").lower()
@@ -1622,7 +1663,7 @@ def page_import_export(df, budgets):
     st.info(
         "Sekarang file Excel hasil export bisa langsung jadi basis upload data berikutnya. "
         "Download Excel Import-Ready / Template Update, edit/tambah transaksi di sheet `Master Kas`, lalu upload lagi dengan mode `Replace semua data`. "
-        "Kalau sheet `Master Kas` tidak ada, app akan coba deteksi sheet transaksi dari kolomnya."
+        "Kalau sheet `Master Kas` tidak ada, app akan coba deteksi sheet `Transaksi`/sheet lain dari kolomnya."
     )
 
     st.subheader("Export")
@@ -1665,6 +1706,11 @@ def page_import_export(df, budgets):
     st.warning("Gunakan Replace kalau file Excel/CSV yang di-upload adalah basis data terbaru. Gunakan Append kalau cuma nambah transaksi baru.")
     upload = st.file_uploader("Upload Excel / CSV / JSON", type=["xlsx", "csv", "json"])
     mode = st.radio("Mode import", ["Replace semua data", "Append transaksi"], horizontal=True)
+    if upload is not None and upload.name.lower().endswith(".xlsx"):
+        try:
+            st.caption("Sheet Excel terbaca: " + ", ".join(workbook_sheet_names(upload)))
+        except Exception as e:
+            st.warning(f"Excel belum bisa dibaca: {type(e).__name__}: {e}")
     if upload is not None:
         if st.button("Proses Import"):
             try:
