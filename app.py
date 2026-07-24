@@ -13,7 +13,7 @@ import requests
 import streamlit as st
 
 APP_TITLE = "V.6 Padebuolo Fresh"
-APP_VERSION = "Beyonddddd SUUUPEEERRRR!!!!"
+APP_VERSION = "V.6.7 Fresh - Beyonddd Superr CRAAZYYYY!!!!"
 DEFAULT_PASSWORD = "rumdin123"
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -736,7 +736,7 @@ def choose_transaction_sheet(file, sheets):
     if best_sheet and best_score >= 4:
         return best_sheet
     raise ValueError(
-        "Sheet transaksi tidak ketemu. Export ulang dari tombol 'Download Excel Import-Ready' atau pastikan ada sheet 'Master Kas'. "
+        "Sheet transaksi tidak ketemu. Export ulang dari tombol 'Download Excel Import-Ready / Template Update' atau pastikan ada sheet 'Master Kas'. "
         f"Sheet yang ada: {', '.join(map(str, sheets))}"
     )
 
@@ -1621,18 +1621,18 @@ def page_import_export(df, budgets):
     st.title("⬆️⬇️ Import / Export")
     st.info(
         "Sekarang file Excel hasil export bisa langsung jadi basis upload data berikutnya. "
-        "Download Excel Import-Ready, edit/tambah transaksi di sheet `Master Kas`, lalu upload lagi dengan mode `Replace semua data`. "
+        "Download Excel Import-Ready / Template Update, edit/tambah transaksi di sheet `Master Kas`, lalu upload lagi dengan mode `Replace semua data`. "
         "Kalau sheet `Master Kas` tidak ada, app akan coba deteksi sheet transaksi dari kolomnya."
     )
 
     st.subheader("Export")
     c1, c2, c3 = st.columns(3)
     c1.download_button(
-        "Download Excel Import-Ready",
+        "Download Excel Import-Ready / Template Update",
         data=make_excel_bytes(),
-        file_name="padebuolo_import_ready_export.xlsx",
+        file_name="padebuolo_template_update_data.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        help="File ini bisa diedit lalu di-upload kembali sebagai basis data baru.",
+        help="File ini formatnya sudah sama dengan input/import, jadi bisa diedit lalu di-upload kembali sebagai database terbaru.",
     )
     c2.download_button(
         "Download JSON Backup",
@@ -1641,9 +1641,9 @@ def page_import_export(df, budgets):
         mime="application/json",
     )
     c3.download_button(
-        "Download Transaksi CSV",
+        "Download Transaksi CSV Import-Ready",
         data=make_master_kas_export().to_csv(index=False).encode("utf-8"),
-        file_name="padebuolo_transaksi_import_ready.csv",
+        file_name="padebuolo_template_transaksi.csv",
         mime="text/csv",
         help="CSV ini juga memakai kolom Indonesia: Tanggal, Sumber Dana, Masuk, Keluar, dan seterusnya.",
     )
@@ -1651,7 +1651,7 @@ def page_import_export(df, budgets):
     with st.expander("Cara update data pakai file export", expanded=False):
         st.markdown(
             """
-1. Klik **Download Excel Import-Ready**.  
+1. Klik **Download Excel Import-Ready / Template Update**.  
 2. Buka Excel-nya, edit atau tambah baris transaksi di sheet **Master Kas**.  
 3. Jangan ubah nama sheet **Master Kas** dan **Biaya Bulanan**.  
 4. Pastikan tanggal tetap **DD/MM/YYYY**, contoh `11/04/2026`.  
